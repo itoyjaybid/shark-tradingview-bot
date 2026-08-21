@@ -13,14 +13,16 @@ SHARK_API_KEY = os.getenv("SHARK_API_KEY", "")
 SHARK_API_SECRET = os.getenv("SHARK_API_SECRET", "")
 WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MY_SECRET_KEY")
 
+
 def generate_signature(secret: str, data: str) -> str:
     return hmac.new(secret.encode("utf-8"), data.encode("utf-8"), hashlib.sha256).hexdigest()
+
 
 def execute_shark_order(side: str, symbol: str, quantity: float, stop_loss_price: float = None, reduce_only: bool = False):
     endpoint = f"{SHARK_BASE_URL}/v1/order/place-order"
     timestamp = str(int(time.time() * 1000))
     
-    # Strip TradingView perpetual suffix if present (e.g. BTCUSDT.P -> BTCUSDT)
+    # Strip TradingView perpetual suffix (e.g., BTCUSDT.P -> BTCUSDT)
     clean_symbol = symbol.replace(".P", "").replace(".p", "")
     
     payload = {
@@ -57,15 +59,17 @@ def execute_shark_order(side: str, symbol: str, quantity: float, stop_loss_price
         print(f"Order Execution Error: {str(e)}")
         return {"error": str(e)}
 
+
 @app.get("/")
 def home():
     return {"status": "awake", "service": "Shark Trading Bot"}
+
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     data = await request.json()
 
-    # 1. Validate passphrase
+    # 1. Verify passphrase
     if data.get("secret") != WEBHOOK_PASSPHRASE:
         raise HTTPException(status_code=403, detail="Invalid secret passphrase")
 
@@ -74,17 +78,25 @@ async def receive_webhook(request: Request):
     quantity = float(data.get("quantity", 0.002))
     sl_price = data.get("sl_price")
 
-    print(f"Signal Received -> Action: {action} | Symbol: {symbol} | SL: {sl_price}")
+    print(f"Signal Received -> Action: {action} | Symbol: {symbol} | Price: {data.get('price')} | SL: {sl_price}")
 
-    # 2. Map TradingView action to Shark Exchange order
+    # 2. Route all strategy actions
     if action == "BUY":
         result = execute_shark_order(side="BUY", symbol=symbol, quantity=quantity, stop_loss_price=sl_price, reduce_only=False)
+
     elif action == "SELL":
         result = execute_shark_order(side="SELL", symbol=symbol, quantity=quantity, stop_loss_price=sl_price, reduce_only=False)
+
     elif action in ["SL_EXIT", "EXIT", "CLOSE"]:
-        # Close/reduce position
+        # Market close existing position
         result = execute_shark_order(side="SELL", symbol=symbol, quantity=quantity, reduce_only=True)
+
+    elif action == "UPDATE_SL":
+        # Trailing Stop-Loss update
+        print(f"Updating Trailing Stop Loss for {symbol} to {sl_price}")
+        result = execute_shark_order(side="SELL", symbol=symbol, quantity=quantity, stop_loss_price=sl_price, reduce_only=True)
+
     else:
-        return {"status": "ignored", "reason": f"Unknown action {action}"}
+        return {"status": "ignored", "reason": f"Unknown action: {action}"}
 
     return {"status": "success", "shark_response": result}
