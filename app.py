@@ -1,4 +1,3 @@
-Python
 from fastapi import FastAPI, Request, HTTPException
 import os
 import requests
@@ -29,5 +28,5 @@ async def receive_webhook(request: Request):
 
     print(f"Signal Received -> Action: {action} | Symbol: {symbol} | Price: {price} | SL: {sl_price}")
 
-    # Shark Exchange API logic goes here
+    # Shark Exchange API execution logic goes here
     return {"status": "success", "data": data}
