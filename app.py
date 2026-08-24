@@ -8,7 +8,7 @@ import socket
 import requests
 import threading
 
-# Force IPv4 for all outbound requests on cloud hosts (Render/Railway)
+# Force IPv4 for outbound requests on cloud hosts (Render/Railway)
 import urllib3.util.connection as urllib3_cn
 
 def allowed_gai_family():
@@ -206,7 +206,7 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
 # ==========================================
 # FASTAPI ROUTES
 # ==========================================
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def home():
     return {"status": "awake", "service": "Shark Trading Bot"}
 
@@ -224,7 +224,8 @@ async def receive_webhook(request: Request):
 
     action = str(data.get("action", "")).upper()
     symbol = str(data.get("symbol", "BTCUSDT"))
-    quantity = float(data.get("quantity", 0.002))
+    # Dynamically extract quantity with a fallback
+    quantity = float(data.get("quantity", 0.05))
     sl_price = float(data.get("sl_price", 0.0))
     current_price = float(data.get("price", 0.0))
 
