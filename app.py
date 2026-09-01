@@ -43,6 +43,38 @@ def get_headers(payload_str: str) -> dict:
     }
 
 
+def get_open_position(symbol: str) -> tuple[float, str]:
+    """
+    Queries Shark Exchange to fetch current open position size and side.
+    Returns: (position_amount, position_side) -> (0.0, None) if flat/no position.
+    """
+    try:
+        ts = str(int(time.time() * 1000))
+        payload = {"timestamp": ts}
+        body = json.dumps(payload, separators=(",", ":"))
+        headers = get_headers(body)
+
+        resp = requests.post(f"{SHARK_BASE_URL}/v1/user/positions", data=body, headers=headers, timeout=5)
+        
+        if resp.status_code in [200, 201]:
+            data = resp.json()
+            positions = data.get("data", []) if isinstance(data.get("data"), list) else data.get("positions", [])
+            
+            clean_sym = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
+            
+            for pos in positions:
+                pos_sym = pos.get("symbol", "").upper()
+                if pos_sym == clean_sym:
+                    amt = float(pos.get("positionAmt", pos.get("quantity", 0.0)))
+                    if amt != 0:
+                        side = "BUY" if amt > 0 else "SELL"
+                        return abs(amt), side
+        return 0.0, None
+    except Exception as e:
+        print(f"[POSITION QUERY ERROR]: {e}")
+        return 0.0, None
+
+
 def delete_single_order(client_order_id: str) -> bool:
     """Deletes an order using the payload schema required by Shark Exchange."""
     try:
@@ -176,11 +208,20 @@ def execute_entry_order(action: str, symbol: str, quantity: float, sl_price: flo
 
 
 def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_price: float):
-    """Deletes old stop and places updated trailing stop."""
+    """Deletes old stop and places updated trailing stop only if position exists."""
     global CURRENT_POSITION_SIDE
     try:
         clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
-        raw_qty = float(quantity)
+        
+        # Position check against exchange
+        open_qty, open_side = get_open_position(clean_symbol)
+        if open_qty == 0.0:
+            print(f"[GUARD TRIGGERED] Discarding UPDATE_SL: No active position found on Shark Exchange for {clean_symbol}.")
+            cancel_all_tracked_stops()
+            return
+
+        CURRENT_POSITION_SIDE = open_side
+        raw_qty = open_qty if open_qty > 0 else float(quantity)
         order_qty = int(raw_qty) if raw_qty.is_integer() else round(raw_qty, 4)
 
         raw_sl = float(sl_price) if sl_price else 0.0
@@ -189,14 +230,7 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
 
         if stop_price > 0:
             cancel_all_tracked_stops()
-
-            if CURRENT_POSITION_SIDE == "SELL":
-                sl_side = "BUY"
-            elif CURRENT_POSITION_SIDE == "BUY":
-                sl_side = "SELL"
-            else:
-                sl_side = "BUY" if (ref_price > 0 and stop_price > ref_price) else "SELL"
-
+            sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
             place_stop_loss(clean_symbol, sl_side, order_qty, stop_price, ref_price)
 
     except Exception as e:
@@ -224,7 +258,6 @@ async def receive_webhook(request: Request):
 
     action = str(data.get("action", "")).upper()
     symbol = str(data.get("symbol", "BTCUSDT"))
-    # Dynamically extract quantity with a fallback
     quantity = float(data.get("quantity", 0.05))
     sl_price = float(data.get("sl_price", 0.0))
     current_price = float(data.get("price", 0.0))
