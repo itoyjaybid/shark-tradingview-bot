@@ -75,10 +75,10 @@ def cancel_all_tracked_stops():
 
 
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0):
-    """Places STOP_MARKET with Error 3011 pre-flight check."""
+    """Places STOP_MARKET order with reduceOnly and Error 3011 pre-flight check."""
     global ACTIVE_SL_CLIENT_IDS
     try:
-        # Pre-flight check: Prevent submitting stops that activate instantly (Error 3011 guard)
+        # Pre-flight check: Prevent submitting stops that would activate immediately
         if ref_price > 0:
             if side == "SELL" and stop_price >= ref_price:
                 print(f"[REJECTED 3011 GUARD] Long SL ({stop_price}) >= Market Price ({ref_price}). Skipping.")
@@ -137,7 +137,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, sl_price: flo
         stop_price = int(raw_sl) if raw_sl.is_integer() else round(raw_sl, 2)
         ref_price = float(current_price) if current_price else 0.0
 
-        # Clear prior resting stops before placing new entry
+        # Cancel any prior resting stops before placing new entry
         cancel_all_tracked_stops()
 
         timestamp = str(int(time.time() * 1000))
@@ -176,14 +176,14 @@ def execute_entry_order(action: str, symbol: str, quantity: float, sl_price: flo
 
 
 def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_price: float):
-    """Safely replaces the existing stop loss with the new trailed price level."""
+    """Safely updates trailing stop loss level only when an active trade is tracked."""
     global CURRENT_POSITION_SIDE
     try:
         clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
 
-        # Guard: If no entry was registered (e.g. alerts were paused during entry), ignore trailing alerts
+        # Guard: Ignore trailing alerts if bot is not tracking an active position
         if CURRENT_POSITION_SIDE is None:
-            print(f"[GUARD TRIGGERED] Discarding UPDATE_SL: No active trade tracked by bot for {clean_symbol}.")
+            print(f"[GUARD TRIGGERED] Discarding UPDATE_SL: No active trade tracked for {clean_symbol}.")
             return
 
         raw_qty = float(quantity)
@@ -194,13 +194,13 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
         ref_price = float(current_price) if current_price else 0.0
 
         if stop_price > 0:
-            # 1. Determine SL side based on active tracked position
+            # Determine SL side based on currently tracked position
             sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
 
-            # 2. Cancel previously active stop loss
+            # Cancel previously resting stop loss
             cancel_all_tracked_stops()
 
-            # 3. Place new trailing stop loss
+            # Place updated trailing stop loss
             place_stop_loss(clean_symbol, sl_side, order_qty, stop_price, ref_price)
 
     except Exception as e:
