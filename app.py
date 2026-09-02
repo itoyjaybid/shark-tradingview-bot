@@ -43,38 +43,6 @@ def get_headers(payload_str: str) -> dict:
     }
 
 
-def get_open_position(symbol: str) -> tuple[float, str]:
-    """
-    Queries Shark Exchange to fetch current open position size and side.
-    Returns: (position_amount, position_side) -> (0.0, None) if flat/no position.
-    """
-    try:
-        ts = str(int(time.time() * 1000))
-        payload = {"timestamp": ts}
-        body = json.dumps(payload, separators=(",", ":"))
-        headers = get_headers(body)
-
-        resp = requests.post(f"{SHARK_BASE_URL}/v1/user/positions", data=body, headers=headers, timeout=5)
-        
-        if resp.status_code in [200, 201]:
-            data = resp.json()
-            positions = data.get("data", []) if isinstance(data.get("data"), list) else data.get("positions", [])
-            
-            clean_sym = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
-            
-            for pos in positions:
-                pos_sym = pos.get("symbol", "").upper()
-                if pos_sym == clean_sym:
-                    amt = float(pos.get("positionAmt", pos.get("quantity", 0.0)))
-                    if amt != 0:
-                        side = "BUY" if amt > 0 else "SELL"
-                        return abs(amt), side
-        return 0.0, None
-    except Exception as e:
-        print(f"[POSITION QUERY ERROR]: {e}")
-        return 0.0, None
-
-
 def delete_single_order(client_order_id: str) -> bool:
     """Deletes an order using the payload schema required by Shark Exchange."""
     try:
@@ -208,20 +176,17 @@ def execute_entry_order(action: str, symbol: str, quantity: float, sl_price: flo
 
 
 def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_price: float):
-    """Deletes old stop and places updated trailing stop only if position exists."""
+    """Safely replaces the existing stop loss with the new trailed price level."""
     global CURRENT_POSITION_SIDE
     try:
         clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
-        
-        # Position check against exchange
-        open_qty, open_side = get_open_position(clean_symbol)
-        if open_qty == 0.0:
-            print(f"[GUARD TRIGGERED] Discarding UPDATE_SL: No active position found on Shark Exchange for {clean_symbol}.")
-            cancel_all_tracked_stops()
+
+        # Guard: If no entry was registered (e.g. alerts were paused during entry), ignore trailing alerts
+        if CURRENT_POSITION_SIDE is None:
+            print(f"[GUARD TRIGGERED] Discarding UPDATE_SL: No active trade tracked by bot for {clean_symbol}.")
             return
 
-        CURRENT_POSITION_SIDE = open_side
-        raw_qty = open_qty if open_qty > 0 else float(quantity)
+        raw_qty = float(quantity)
         order_qty = int(raw_qty) if raw_qty.is_integer() else round(raw_qty, 4)
 
         raw_sl = float(sl_price) if sl_price else 0.0
@@ -229,12 +194,24 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
         ref_price = float(current_price) if current_price else 0.0
 
         if stop_price > 0:
-            cancel_all_tracked_stops()
+            # 1. Determine SL side based on active tracked position
             sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
+
+            # 2. Cancel previously active stop loss
+            cancel_all_tracked_stops()
+
+            # 3. Place new trailing stop loss
             place_stop_loss(clean_symbol, sl_side, order_qty, stop_price, ref_price)
 
     except Exception as e:
         print(f"[TRAILING SL ERROR]: {e}")
+
+
+def reset_and_cleanup():
+    """Resets tracking state and clears any leftover resting stops."""
+    global CURRENT_POSITION_SIDE
+    CURRENT_POSITION_SIDE = None
+    cancel_all_tracked_stops()
 
 
 # ==========================================
@@ -281,7 +258,7 @@ async def receive_webhook(request: Request):
 
     elif action in ["SL_EXIT", "EXIT", "CLOSE"]:
         threading.Thread(
-            target=cancel_all_tracked_stops,
+            target=reset_and_cleanup,
             daemon=True
         ).start()
 
