@@ -75,19 +75,19 @@ def cancel_all_tracked_stops():
 
 
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0):
-    """Places STOP_MARKET order with reduceOnly and Error 3011 pre-flight check."""
+    """Places STOP_MARKET order with reduceOnly and price validation."""
     global ACTIVE_SL_CLIENT_IDS
     try:
         # Pre-flight check: Prevent submitting stops that would activate immediately
         if ref_price > 0:
             if side == "SELL" and stop_price >= ref_price:
-                print(f"[REJECTED 3011 GUARD] Long SL ({stop_price}) >= Market Price ({ref_price}). Skipping.")
+                print(f"[REJECTED GUARD] Long SL ({stop_price}) >= Market Price ({ref_price}). Skipping.")
                 return
             if side == "BUY" and stop_price <= ref_price:
-                print(f"[REJECTED 3011 GUARD] Short SL ({stop_price}) <= Market Price ({ref_price}). Skipping.")
+                print(f"[REJECTED GUARD] Short SL ({stop_price}) <= Market Price ({ref_price}). Skipping.")
                 return
 
-        time.sleep(0.1)
+        time.sleep(0.15)
         sl_timestamp = str(int(time.time() * 1000))
 
         sl_params = {
@@ -115,7 +115,7 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
             cid = res_data.get("clientOrderId") or res_data.get("data", {}).get("clientOrderId")
             if cid:
                 ACTIVE_SL_CLIENT_IDS.append(cid)
-                print(f">>> [SUCCESS] Trailing SL Placed! Active clientOrderId: {cid}")
+                print(f">>> [SUCCESS] SL Placed! Active clientOrderId: {cid}")
             else:
                 print(f">>> [SUCCESS] Response: {res_data}")
         else:
@@ -125,26 +125,37 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
 
 def execute_entry_order(action: str, symbol: str, quantity: float, sl_price: float = 0.0, current_price: float = 0.0):
-    """Executes Market Entry, cleans old stops, and attaches initial SL."""
+    """Executes Market Entry or Reversal, cancels old stops, and sets new SL."""
     global CURRENT_POSITION_SIDE
     try:
         clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
-        side = action.upper()
         raw_qty = float(quantity)
-        order_qty = int(raw_qty) if raw_qty.is_integer() else round(raw_qty, 4)
+        target_qty = int(raw_qty) if raw_qty.is_integer() else round(raw_qty, 4)
+
+        # Handle Reversal vs Standard Entry
+        if action == "REVERSE_BUY":
+            side = "BUY"
+            exec_qty = round(target_qty * 2, 4)  # 0.05 to close short + 0.05 to open long = 0.10
+        elif action == "REVERSE_SELL":
+            side = "SELL"
+            exec_qty = round(target_qty * 2, 4)  # 0.05 to close long + 0.05 to open short = 0.10
+        else:
+            side = action.upper()
+            exec_qty = target_qty
 
         raw_sl = float(sl_price) if sl_price else 0.0
         stop_price = int(raw_sl) if raw_sl.is_integer() else round(raw_sl, 2)
         ref_price = float(current_price) if current_price else 0.0
 
-        # Cancel any prior resting stops before placing new entry
+        # Step 1: Clean any existing stop loss orders before entering new position
         cancel_all_tracked_stops()
 
+        # Step 2: Send Market Order
         timestamp = str(int(time.time() * 1000))
         entry_params = {
             "timestamp": timestamp,
             "placeType": "ORDER_FORM",
-            "quantity": order_qty,
+            "quantity": exec_qty,
             "side": side,
             "symbol": clean_symbol,
             "type": "MARKET",
@@ -157,7 +168,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, sl_price: flo
         entry_body = json.dumps(entry_params, separators=(",", ":"))
         entry_headers = get_headers(entry_body)
 
-        print(f"\n[ENTRY] Placing {side} {order_qty} {clean_symbol}...")
+        print(f"\n[ENTRY] Placing {side} {exec_qty} {clean_symbol} (Target Net: {target_qty})...")
         resp_entry = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=entry_body, headers=entry_headers, timeout=5)
 
         if resp_entry.status_code in [200, 201]:
@@ -167,9 +178,10 @@ def execute_entry_order(action: str, symbol: str, quantity: float, sl_price: flo
             print(f">>> [ENTRY ERROR HTTP {resp_entry.status_code}]: {resp_entry.text}")
             return
 
+        # Step 3: Place new Stop Loss for target net position
         if stop_price > 0:
             sl_side = "SELL" if side == "BUY" else "BUY"
-            place_stop_loss(clean_symbol, sl_side, order_qty, stop_price, ref_price)
+            place_stop_loss(clean_symbol, sl_side, target_qty, stop_price, ref_price)
 
     except Exception as e:
         print(f"[BRIDGE EXECUTION ERROR]: {e}")
@@ -181,7 +193,6 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
     try:
         clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
 
-        # Guard: Ignore trailing alerts if bot is not tracking an active position
         if CURRENT_POSITION_SIDE is None:
             print(f"[GUARD TRIGGERED] Discarding UPDATE_SL: No active trade tracked for {clean_symbol}.")
             return
@@ -194,13 +205,8 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
         ref_price = float(current_price) if current_price else 0.0
 
         if stop_price > 0:
-            # Determine SL side based on currently tracked position
             sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
-
-            # Cancel previously resting stop loss
             cancel_all_tracked_stops()
-
-            # Place updated trailing stop loss
             place_stop_loss(clean_symbol, sl_side, order_qty, stop_price, ref_price)
 
     except Exception as e:
@@ -229,7 +235,6 @@ async def receive_webhook(request: Request):
     except Exception:
         return {"status": "ignored_empty"}
 
-    # 1. Verify passphrase
     if data.get("secret") != WEBHOOK_PASSPHRASE:
         raise HTTPException(status_code=403, detail="Invalid secret passphrase")
 
@@ -241,8 +246,7 @@ async def receive_webhook(request: Request):
 
     print(f"\n[ALERT RECEIVED] Action: {action} | Symbol: {symbol} | Qty: {quantity} | SL: {sl_price} | Price: {current_price}")
 
-    # 2. Dispatch background thread
-    if action in ["BUY", "SELL"]:
+    if action in ["BUY", "SELL", "REVERSE_BUY", "REVERSE_SELL"]:
         threading.Thread(
             target=execute_entry_order,
             args=(action, symbol, quantity, sl_price, current_price),
