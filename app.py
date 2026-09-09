@@ -43,6 +43,45 @@ def get_headers(payload_str: str) -> dict:
     }
 
 
+def get_real_exchange_position(symbol: str) -> float:
+    """
+    Fetches the live open position size directly from Shark Exchange.
+    Returns:
+       > 0 for Long (e.g., +0.1)
+       < 0 for Short (e.g., -0.1)
+       0.0 for Flat
+    """
+    try:
+        ts = str(int(time.time() * 1000))
+        payload = {"timestamp": ts}
+        body = json.dumps(payload, separators=(",", ":"))
+        headers = get_headers(body)
+
+        resp = requests.post(f"{SHARK_BASE_URL}/v1/position/all-positions", data=body, headers=headers, timeout=5)
+        if resp.status_code == 200:
+            res_json = resp.json()
+            positions = res_json.get("data", []) if isinstance(res_json, dict) else res_json
+
+            clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
+
+            for pos in positions:
+                pos_sym = pos.get("symbol", "").upper()
+                if pos_sym == clean_symbol:
+                    raw_qty = float(pos.get("positionAmount", 0.0) or pos.get("amount", 0.0) or 0.0)
+                    side = str(pos.get("side", "") or pos.get("positionSide", "")).upper()
+                    
+                    if side in ["SELL", "SHORT"]:
+                        return -abs(raw_qty)
+                    elif side in ["BUY", "LONG"]:
+                        return abs(raw_qty)
+                    return raw_qty
+
+        return 0.0
+    except Exception as e:
+        print(f"[FETCH POSITION ERROR]: {e}")
+        return 0.0
+
+
 def delete_single_order(client_order_id: str) -> bool:
     """Deletes an order using the payload schema required by Shark Exchange."""
     try:
@@ -78,7 +117,6 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
     """Places STOP_MARKET order with reduceOnly and price validation."""
     global ACTIVE_SL_CLIENT_IDS
     try:
-        # Pre-flight check: Prevent submitting stops that would activate immediately
         if ref_price > 0:
             if side == "SELL" and stop_price >= ref_price:
                 print(f"[REJECTED GUARD] Long SL ({stop_price}) >= Market Price ({ref_price}). Skipping.")
@@ -125,32 +163,41 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
 
 def execute_entry_order(action: str, symbol: str, quantity: float, sl_price: float = 0.0, current_price: float = 0.0):
-    """Executes Market Entry or Reversal, cancels old stops, and sets new SL."""
+    """
+    Executes entry dynamically based on the REAL live position size on Shark Exchange.
+    Automatically prevents over-sizing from paused, missed, or desynchronized alerts.
+    """
     global CURRENT_POSITION_SIDE
     try:
         clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
-        raw_qty = float(quantity)
-        target_qty = int(raw_qty) if raw_qty.is_integer() else round(raw_qty, 4)
+        target_qty = float(quantity)
 
-        # Handle Reversal vs Standard Entry
-        if action == "REVERSE_BUY":
-            side = "BUY"
-            exec_qty = round(target_qty * 2, 4)  # 0.05 to close short + 0.05 to open long = 0.10
-        elif action == "REVERSE_SELL":
-            side = "SELL"
-            exec_qty = round(target_qty * 2, 4)  # 0.05 to close long + 0.05 to open short = 0.10
-        else:
-            side = action.upper()
-            exec_qty = target_qty
+        # 1. Query live balance on the exchange
+        real_current_pos = get_real_exchange_position(clean_symbol)
+        print(f"[EXCHANGE AUDIT] Symbol: {clean_symbol} | Real Live Position: {real_current_pos}")
+
+        # 2. Compute intended position
+        is_buy_intent = "BUY" in action.upper()
+        intended_net_pos = target_qty if is_buy_intent else -target_qty
+
+        # 3. Calculate exact delta to fill
+        diff = round(intended_net_pos - real_current_pos, 4)
+
+        if abs(diff) < 0.0001:
+            print(f"[NO-OP] Live position ({real_current_pos}) already matches target ({intended_net_pos}).")
+            return
+
+        side = "BUY" if diff > 0 else "SELL"
+        exec_qty = round(abs(diff), 4)
 
         raw_sl = float(sl_price) if sl_price else 0.0
         stop_price = int(raw_sl) if raw_sl.is_integer() else round(raw_sl, 2)
         ref_price = float(current_price) if current_price else 0.0
 
-        # Step 1: Clean any existing stop loss orders before entering new position
+        # Step A: Clear existing resting stop orders
         cancel_all_tracked_stops()
 
-        # Step 2: Send Market Order
+        # Step B: Submit Market Order
         timestamp = str(int(time.time() * 1000))
         entry_params = {
             "timestamp": timestamp,
@@ -168,19 +215,19 @@ def execute_entry_order(action: str, symbol: str, quantity: float, sl_price: flo
         entry_body = json.dumps(entry_params, separators=(",", ":"))
         entry_headers = get_headers(entry_body)
 
-        print(f"\n[ENTRY] Placing {side} {exec_qty} {clean_symbol} (Target Net: {target_qty})...")
+        print(f"\n[ENTRY] Real Pos: {real_current_pos} -> Executing {side} {exec_qty} {clean_symbol} (Target Net: {target_qty})...")
         resp_entry = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=entry_body, headers=entry_headers, timeout=5)
 
         if resp_entry.status_code in [200, 201]:
-            CURRENT_POSITION_SIDE = side
+            CURRENT_POSITION_SIDE = "BUY" if is_buy_intent else "SELL"
             print(f">>> [SUCCESS] Entry Filled! Response: {resp_entry.json()}")
         else:
             print(f">>> [ENTRY ERROR HTTP {resp_entry.status_code}]: {resp_entry.text}")
             return
 
-        # Step 3: Place new Stop Loss for target net position
+        # Step C: Place Stop Loss sized strictly to the target net position
         if stop_price > 0:
-            sl_side = "SELL" if side == "BUY" else "BUY"
+            sl_side = "SELL" if is_buy_intent else "BUY"
             place_stop_loss(clean_symbol, sl_side, target_qty, stop_price, ref_price)
 
     except Exception as e:
@@ -188,14 +235,20 @@ def execute_entry_order(action: str, symbol: str, quantity: float, sl_price: flo
 
 
 def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_price: float):
-    """Safely updates trailing stop loss level only when an active trade is tracked."""
+    """Safely updates trailing stop loss level, verifying against exchange positions on cold restarts."""
     global CURRENT_POSITION_SIDE
     try:
         clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
 
         if CURRENT_POSITION_SIDE is None:
-            print(f"[GUARD TRIGGERED] Discarding UPDATE_SL: No active trade tracked for {clean_symbol}.")
-            return
+            real_pos = get_real_exchange_position(clean_symbol)
+            if real_pos > 0:
+                CURRENT_POSITION_SIDE = "BUY"
+            elif real_pos < 0:
+                CURRENT_POSITION_SIDE = "SELL"
+            else:
+                print(f"[GUARD TRIGGERED] Discarding UPDATE_SL: No active trade tracked for {clean_symbol}.")
+                return
 
         raw_qty = float(quantity)
         order_qty = int(raw_qty) if raw_qty.is_integer() else round(raw_qty, 4)
