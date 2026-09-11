@@ -167,7 +167,8 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: float, trade_id: int):
     """
     Background worker: monitors Shark Exchange until the Limit Entry fills.
-    Detects any active fill in the expected direction and places the +/- 100 pt SL.
+    - If filled: places the +/- 100 pt initial Stop Loss.
+    - If timeout occurs without a fill: automatically cancels the resting limit order.
     """
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE
     is_buy = target_side == "BUY"
@@ -183,7 +184,7 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
 
         current_pos = get_real_exchange_position(clean_symbol)
 
-        # Detect position execution in intended direction regardless of exact payload qty
+        # Detect position execution in intended direction
         is_filled = (is_buy and current_pos > 0.00001) or (not is_buy and current_pos < -0.00001)
 
         if is_filled:
@@ -202,7 +203,9 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
             place_stop_loss(clean_symbol, sl_side, actual_qty, initial_stop, entry_price)
             return
 
-    print(f"[WATCHER] Limit order did not fill within timeout window.")
+    # Loop finished without execution -> auto-cancel order on exchange
+    print(f"[WATCHER] Limit order did not fill within timeout window. Canceling on exchange...")
+    cancel_pending_limit_entry()
 
 
 def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_price: float, trade_id: int):
@@ -256,7 +259,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             ACTIVE_ENTRY_ORDER_ID = res_data.get("clientOrderId") or res_data.get("data", {}).get("clientOrderId")
             print(f">>> [SUCCESS] Limit Entry Posted. Order ID: {ACTIVE_ENTRY_ORDER_ID}")
 
-            # Step 3: Monitor fill in background, then place stop loss
+            # Step 3: Monitor fill in background, place SL, or auto-cancel on timeout
             threading.Thread(
                 target=wait_for_fill_and_set_sl,
                 args=(clean_symbol, side, target_limit_price, trade_id),
