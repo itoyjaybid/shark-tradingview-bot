@@ -68,6 +68,30 @@ def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
         return False
 
 
+def get_order_executed_price(client_order_id: str, symbol: str, fallback_price: float) -> float:
+    """Queries Shark Exchange to fetch the exact filled execution price."""
+    try:
+        ts = str(int(time.time() * 1000))
+        query_str = f"clientOrderId={client_order_id}&symbol={symbol}&timestamp={ts}"
+        headers = get_headers(query_str)
+
+        resp = requests.get(f"{SHARK_BASE_URL}/v1/order/order-detail?{query_str}", headers=headers, timeout=5)
+        if resp.status_code == 200:
+            res_data = resp.json()
+            data = res_data.get("data", res_data)
+            fill_p = float(
+                data.get("avgPrice")
+                or data.get("executedPrice")
+                or data.get("price")
+                or 0.0
+            )
+            if fill_p > 0:
+                return fill_p
+    except Exception as e:
+        print(f"[FETCH FILL PRICE ERROR]: {e}")
+    return fallback_price
+
+
 def delete_single_order(client_order_id: str) -> bool:
     """Cancels a specific resting order."""
     try:
@@ -85,7 +109,7 @@ def delete_single_order(client_order_id: str) -> bool:
 
 
 def cancel_all_tracked_stops():
-    """Cancels active stop orders."""
+    """Cancels active stop loss orders."""
     global ACTIVE_SL_CLIENT_IDS
     if not ACTIVE_SL_CLIENT_IDS:
         return
@@ -155,14 +179,17 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
 
 def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: float, trade_id: int, quantity: float):
-    """Monitors whether the limit order fills, then sets initial SL."""
+    """
+    Monitors entry order execution. Upon fill, retrieves the true executed price
+    from Shark Exchange to place the full 100-point stop loss.
+    """
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, ACTIVE_ENTRY_ORDER_ID
     is_buy = target_side == "BUY"
 
-    print(f"[WATCHER] Polling Shark Exchange for {target_side} fill @ {entry_price}...")
+    print(f"[WATCHER] Polling Shark Exchange for {target_side} fill...")
 
     # Wait up to 4 minutes (120 cycles * 2 seconds)
-    for _ in range(300):
+    for _ in range(120):
         time.sleep(2.0)
         if CURRENT_TRADE_ID != trade_id:
             print(f"[WATCHER] Trade {trade_id} superseded. Exiting.")
@@ -174,13 +201,16 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
         still_open = is_entry_order_open(ACTIVE_ENTRY_ORDER_ID, clean_symbol)
 
         if not still_open:
-            print(f">>> [LIMIT FILLED] Entry order filled. Placing initial Stop-Limit...")
+            # Query the true fill price
+            real_fill_price = get_order_executed_price(ACTIVE_ENTRY_ORDER_ID, clean_symbol, entry_price)
+            print(f">>> [LIMIT FILLED] Real Fill Price: {real_fill_price}. Placing initial 100pt Stop-Limit...")
             CURRENT_POSITION_SIDE = target_side
 
-            initial_stop = round(entry_price - 100.0, 2) if is_buy else round(entry_price + 100.0, 2)
+            # Calculate SL from actual fill price
+            initial_stop = round(real_fill_price - 100.0, 2) if is_buy else round(real_fill_price + 100.0, 2)
             sl_side = "SELL" if is_buy else "BUY"
 
-            place_stop_loss(clean_symbol, sl_side, quantity, initial_stop, entry_price)
+            place_stop_loss(clean_symbol, sl_side, quantity, initial_stop, real_fill_price)
             return
 
     print(f"[WATCHER] Limit order timed out without fill. Canceling...")
