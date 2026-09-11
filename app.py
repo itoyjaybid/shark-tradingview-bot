@@ -9,6 +9,7 @@ import requests
 import threading
 import urllib3.util.connection as urllib3_cn
 
+# Force IPv4 resolution on cloud environments (Render, Railway, etc.)
 def allowed_gai_family():
     return socket.AF_INET
 
@@ -28,10 +29,12 @@ CURRENT_TRADE_ID = None
 CURRENT_POSITION_SIDE = None
 ACTIVE_SL_CLIENT_IDS = []
 ACTIVE_ENTRY_ORDER_ID = None
+
 ORDER_EXECUTION_LOCK = threading.Lock()
 
 
 def generate_signature(secret: str, data: str) -> str:
+    """Computes HMAC-SHA256 signature on query string (GET) or body (POST/DELETE)."""
     return hmac.new(secret.encode("utf-8"), data.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -61,7 +64,7 @@ def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
                     return True
         return False
     except Exception as e:
-        print(f"[STATUS ERROR]: {e}")
+        print(f"[STATUS CHECK ERROR]: {e}")
         return False
 
 
@@ -101,7 +104,7 @@ def cancel_pending_limit_entry():
 
 
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0):
-    """Submits a STOP_LIMIT order."""
+    """Submits a STOP_LIMIT order with INR marginAsset and string-formatted values."""
     global ACTIVE_SL_CLIENT_IDS
     try:
         if ref_price > 0:
@@ -120,14 +123,14 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
         sl_params = {
             "timestamp": str(int(time.time() * 1000)),
             "placeType": "ORDER_FORM",
-            "quantity": float(quantity),
+            "quantity": f"{float(quantity):.4f}",
             "side": side,
             "symbol": symbol,
             "type": "STOP_LIMIT",
-            "price": limit_price,
-            "stopPrice": stop_price,
+            "price": f"{limit_price:.2f}",
+            "stopPrice": f"{stop_price:.2f}",
             "reduceOnly": True,
-            "marginAsset": "USDT",
+            "marginAsset": "INR",
             "deviceType": "WEB",
             "userCategory": "EXTERNAL"
         }
@@ -157,7 +160,7 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
 
     print(f"[WATCHER] Polling Shark Exchange for {target_side} fill @ {entry_price}...")
 
-    # Wait 4 minutes (120 cycles * 2 seconds)
+    # Wait up to 4 minutes (120 cycles * 2 seconds)
     for _ in range(120):
         time.sleep(2.0)
         if CURRENT_TRADE_ID != trade_id:
@@ -169,7 +172,7 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
 
         still_open = is_entry_order_open(ACTIVE_ENTRY_ORDER_ID, clean_symbol)
 
-        # If it's no longer in open orders, it filled
+        # If it is no longer in open orders, the limit order filled
         if not still_open:
             print(f">>> [LIMIT FILLED] Entry order filled. Placing initial Stop-Limit...")
             CURRENT_POSITION_SIDE = target_side
@@ -193,7 +196,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
             target_qty = float(quantity)
 
-            # Clean previous state
+            # Cancel previous resting stops and unfilled limit orders
             cancel_pending_limit_entry()
             cancel_all_tracked_stops()
 
@@ -204,13 +207,13 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             entry_params = {
                 "timestamp": str(int(time.time() * 1000)),
                 "placeType": "ORDER_FORM",
-                "quantity": target_qty,
+                "quantity": f"{target_qty:.4f}",
                 "side": side,
                 "symbol": clean_symbol,
                 "type": "LIMIT",
-                "price": round(target_limit_price, 2),
+                "price": f"{round(target_limit_price, 2):.2f}",
                 "reduceOnly": False,
-                "marginAsset": "USDT",
+                "marginAsset": "INR",
                 "deviceType": "WEB",
                 "userCategory": "EXTERNAL"
             }
@@ -218,7 +221,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             entry_body = json.dumps(entry_params, separators=(",", ":"))
             entry_headers = get_headers(entry_body)
 
-            print(f"\n[LIMIT ENTRY] Submitting {side} {target_qty} {clean_symbol} @ Limit Price {target_limit_price}...")
+            print(f"\n[LIMIT ENTRY] Placing {side} {target_qty:.4f} {clean_symbol} @ Limit Price {target_limit_price:.2f}...")
             resp_entry = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=entry_body, headers=entry_headers, timeout=5)
 
             if resp_entry.status_code in [200, 201]:
@@ -244,7 +247,6 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
         try:
             clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
 
-            # Ignore trails if we have no active confirmed position or wrong trade ID
             if CURRENT_TRADE_ID is not None and trade_id != CURRENT_TRADE_ID:
                 print(f"[DESYNC GUARD] Alert trade_id ({trade_id}) != current ({CURRENT_TRADE_ID}). Ignored.")
                 return
