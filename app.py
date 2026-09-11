@@ -191,7 +191,7 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
     print(f"[WATCHER] Polling Shark Exchange for {target_side} fill...")
 
     # Wait up to 4 minutes (120 cycles * 2 seconds)
-    for _ in range(120):
+    for _ in range(300):
         time.sleep(2.0)
         if CURRENT_TRADE_ID != trade_id:
             print(f"[WATCHER] Trade {trade_id} superseded. Exiting.")
