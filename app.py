@@ -9,6 +9,7 @@ import requests
 import threading
 import urllib3.util.connection as urllib3_cn
 
+# Force IPv4 resolution on cloud environments (Render, Railway, etc.)
 def allowed_gai_family():
     return socket.AF_INET
 
@@ -16,6 +17,9 @@ urllib3_cn.allowed_gai_family = allowed_gai_family
 
 app = FastAPI()
 
+# ==========================================
+# CONFIGURATION & RUNTIME STATE
+# ==========================================
 SHARK_BASE_URL = "https://api.sharkexchange.in"
 SHARK_API_KEY = os.getenv("SHARK_API_KEY", "").strip()
 SHARK_API_SECRET = os.getenv("SHARK_API_SECRET", "").strip()
@@ -41,6 +45,13 @@ def get_headers(payload_str: str) -> dict:
 
 
 def get_real_exchange_position(symbol: str) -> float:
+    """
+    Audits active position directly on Shark Exchange.
+    Returns:
+        > 0 for Long (e.g., +0.002)
+        < 0 for Short (e.g., -0.002)
+        0.0 for Flat
+    """
     try:
         ts = str(int(time.time() * 1000))
         payload = {"timestamp": ts}
@@ -69,6 +80,7 @@ def get_real_exchange_position(symbol: str) -> float:
 
 
 def delete_single_order(client_order_id: str) -> bool:
+    """Cancels a specific order on Shark Exchange."""
     try:
         ts = str(int(time.time() * 1000))
         payload = {"timestamp": ts, "clientOrderId": str(client_order_id)}
@@ -76,7 +88,7 @@ def delete_single_order(client_order_id: str) -> bool:
         headers = get_headers(body)
 
         resp = requests.delete(f"{SHARK_BASE_URL}/v1/order/delete-order", data=body, headers=headers, timeout=5)
-        print(f"[CLEANUP] Deleted Order ({client_order_id}) -> HTTP {resp.status_code}")
+        print(f"[CLEANUP] Canceled order ({client_order_id}) -> HTTP {resp.status_code}")
         return resp.status_code in [200, 201, 204]
     except Exception as e:
         print(f"[CLEANUP ERROR]: {e}")
@@ -84,6 +96,7 @@ def delete_single_order(client_order_id: str) -> bool:
 
 
 def cancel_all_tracked_stops():
+    """Cancels all resting stop orders."""
     global ACTIVE_SL_CLIENT_IDS
     if not ACTIVE_SL_CLIENT_IDS:
         return
@@ -93,14 +106,19 @@ def cancel_all_tracked_stops():
 
 
 def cancel_pending_limit_entry():
+    """Cancels unfilled resting Limit entry orders."""
     global ACTIVE_ENTRY_ORDER_ID
     if ACTIVE_ENTRY_ORDER_ID:
-        print(f"[ENTRY CLEANUP] Canceling unfilled limit entry: {ACTIVE_ENTRY_ORDER_ID}")
+        print(f"[ENTRY CLEANUP] Canceling pending limit entry: {ACTIVE_ENTRY_ORDER_ID}")
         delete_single_order(ACTIVE_ENTRY_ORDER_ID)
         ACTIVE_ENTRY_ORDER_ID = None
 
 
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0):
+    """
+    Submits a STOP_LIMIT order.
+    Uses stop_price as trigger threshold and applies a 15-pt limit offset.
+    """
     global ACTIVE_SL_CLIENT_IDS
     try:
         if ref_price > 0:
@@ -146,32 +164,34 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
         print(f"[SL EXEC ERROR]: {e}")
 
 
-def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, target_qty: float, entry_price: float, trade_id: int):
+def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: float, trade_id: int):
     """
-    Background worker: monitors Shark Exchange until the Limit Entry fills,
-    then automatically places the exact +/- 100 points initial SL.
+    Background worker: monitors Shark Exchange until the Limit Entry fills.
+    Detects any active fill in the expected direction and places the +/- 100 pt SL.
     """
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE
     is_buy = target_side == "BUY"
-    expected_pos = target_qty if is_buy else -target_qty
 
-    print(f"[WATCHER] Polling exchange for fill on Limit {target_side} {target_qty} @ {entry_price}...")
+    print(f"[WATCHER] Polling Shark Exchange for {target_side} fill @ {entry_price}...")
 
-    # Poll up to 60 times (every 2 seconds = 2 minutes active monitoring)
-    for _ in range(60):
+    # Poll up to 120 times (2s intervals = 4 minutes active monitoring)
+    for _ in range(120):
         time.sleep(2.0)
         if CURRENT_TRADE_ID != trade_id:
-            print(f"[WATCHER] Trade {trade_id} superseded by a newer trade. Exiting watcher.")
+            print(f"[WATCHER] Trade {trade_id} superseded by a newer trade. Exiting.")
             return
 
         current_pos = get_real_exchange_position(clean_symbol)
 
-        # Order has filled
-        if (is_buy and current_pos >= (expected_pos - 0.0001)) or (not is_buy and current_pos <= (expected_pos + 0.0001)):
+        # Detect position execution in intended direction regardless of exact payload qty
+        is_filled = (is_buy and current_pos > 0.00001) or (not is_buy and current_pos < -0.00001)
+
+        if is_filled:
+            actual_qty = round(abs(current_pos), 4)
             print(f">>> [LIMIT FILLED] Active position confirmed at {current_pos}. Placing initial Stop-Limit...")
             CURRENT_POSITION_SIDE = target_side
-            
-            # Compute exact 100 points from limit fill
+
+            # Exact 100 points calculated from executed limit price
             if is_buy:
                 initial_stop = round(entry_price - 100.0, 2)
                 sl_side = "SELL"
@@ -179,7 +199,7 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, target_qty: fl
                 initial_stop = round(entry_price + 100.0, 2)
                 sl_side = "BUY"
 
-            place_stop_loss(clean_symbol, sl_side, target_qty, initial_stop, entry_price)
+            place_stop_loss(clean_symbol, sl_side, actual_qty, initial_stop, entry_price)
             return
 
     print(f"[WATCHER] Limit order did not fill within timeout window.")
@@ -191,7 +211,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
         clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
         target_qty = float(quantity)
 
-        # Step 1: Clean up any past stops and unfilled limits
+        # Step 1: Clean up past stops and unfilled limits
         cancel_pending_limit_entry()
         cancel_all_tracked_stops()
 
@@ -210,7 +230,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
         exec_qty = round(abs(diff), 4)
         CURRENT_TRADE_ID = trade_id
 
-        # Step 2: Submit LIMIT Entry Order to Shark Exchange
+        # Step 2: Post LIMIT Entry Order to Shark Exchange
         entry_params = {
             "timestamp": str(int(time.time() * 1000)),
             "placeType": "ORDER_FORM",
@@ -234,12 +254,12 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
         if resp_entry.status_code in [200, 201]:
             res_data = resp_entry.json()
             ACTIVE_ENTRY_ORDER_ID = res_data.get("clientOrderId") or res_data.get("data", {}).get("clientOrderId")
-            print(f">>> [SUCCESS] Limit Entry Posted to Book. Order ID: {ACTIVE_ENTRY_ORDER_ID}")
+            print(f">>> [SUCCESS] Limit Entry Posted. Order ID: {ACTIVE_ENTRY_ORDER_ID}")
 
-            # Step 3: Spawn thread to wait for fill, then place initial 100 pt SL
+            # Step 3: Monitor fill in background, then place stop loss
             threading.Thread(
                 target=wait_for_fill_and_set_sl,
-                args=(clean_symbol, side, target_qty, target_limit_price, trade_id),
+                args=(clean_symbol, side, target_limit_price, trade_id),
                 daemon=True
             ).start()
         else:
@@ -277,6 +297,9 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
         print(f"[TRAILING SL ERROR]: {e}")
 
 
+# ==========================================
+# FASTAPI ENDPOINTS
+# ==========================================
 @app.api_route("/", methods=["GET", "HEAD"])
 def home():
     return {"status": "awake", "service": "Shark Limit-Trading Bot"}
