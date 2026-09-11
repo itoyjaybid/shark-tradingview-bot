@@ -30,18 +30,19 @@ CURRENT_POSITION_SIDE = None
 ACTIVE_SL_CLIENT_IDS = []
 ACTIVE_ENTRY_ORDER_ID = None
 
-# Thread lock to eliminate race conditions between incoming webhooks and watcher cancellations
+# Thread lock to avoid race conditions between alert processing and order timeouts
 ORDER_EXECUTION_LOCK = threading.Lock()
 
 
 def generate_signature(secret: str, data: str) -> str:
+    """Computes HMAC-SHA256 signature on query string (GET) or body (POST/DELETE)."""
     return hmac.new(secret.encode("utf-8"), data.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def get_headers(payload_str: str) -> dict:
+def get_headers(payload_or_querystr: str) -> dict:
     return {
         "api-key": SHARK_API_KEY,
-        "signature": generate_signature(SHARK_API_SECRET, payload_str),
+        "signature": generate_signature(SHARK_API_SECRET, payload_or_querystr),
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
     }
@@ -49,19 +50,19 @@ def get_headers(payload_str: str) -> dict:
 
 def get_real_exchange_position(symbol: str) -> float:
     """
-    Audits active position directly on Shark Exchange.
+    Queries open positions via GET /v1/positions.
     Returns:
-        > 0 for Long (e.g., +0.002)
-        < 0 for Short (e.g., -0.002)
+        > 0 for Long
+        < 0 for Short
         0.0 for Flat
     """
     try:
         ts = str(int(time.time() * 1000))
-        payload = {"timestamp": ts}
-        body = json.dumps(payload, separators=(",", ":"))
-        headers = get_headers(body)
+        query_str = f"timestamp={ts}"
+        headers = get_headers(query_str)
 
-        resp = requests.post(f"{SHARK_BASE_URL}/v1/position/all-positions", data=body, headers=headers, timeout=5)
+        resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{query_str}", headers=headers, timeout=5)
+
         if resp.status_code == 200:
             res_json = resp.json()
             positions = res_json.get("data", []) if isinstance(res_json, dict) else res_json
@@ -82,7 +83,7 @@ def get_real_exchange_position(symbol: str) -> float:
                     )
                     raw_qty = float(raw_val)
                     side = str(pos.get("side", "") or pos.get("positionSide", "")).upper()
-                    
+
                     if side in ["SELL", "SHORT"]:
                         return -abs(raw_qty)
                     elif side in ["BUY", "LONG"]:
@@ -97,7 +98,7 @@ def get_real_exchange_position(symbol: str) -> float:
 
 
 def delete_single_order(client_order_id: str) -> bool:
-    """Cancels a specific order on Shark Exchange and logs the response payload."""
+    """Cancels a specific order on Shark Exchange."""
     try:
         ts = str(int(time.time() * 1000))
         payload = {"timestamp": ts, "clientOrderId": str(client_order_id)}
@@ -113,7 +114,7 @@ def delete_single_order(client_order_id: str) -> bool:
 
 
 def cancel_all_tracked_stops():
-    """Cancels all resting stop orders."""
+    """Cancels active resting stop orders."""
     global ACTIVE_SL_CLIENT_IDS
     if not ACTIVE_SL_CLIENT_IDS:
         return
@@ -123,7 +124,7 @@ def cancel_all_tracked_stops():
 
 
 def cancel_pending_limit_entry():
-    """Cancels unfilled resting Limit entry orders."""
+    """Cancels resting unfilled Limit entry orders."""
     global ACTIVE_ENTRY_ORDER_ID
     if ACTIVE_ENTRY_ORDER_ID:
         print(f"[ENTRY CLEANUP] Canceling pending limit entry: {ACTIVE_ENTRY_ORDER_ID}")
@@ -132,18 +133,15 @@ def cancel_pending_limit_entry():
 
 
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0):
-    """
-    Submits a STOP_LIMIT order.
-    Uses stop_price as trigger threshold and applies a 15-pt buffer.
-    """
+    """Submits a STOP_LIMIT order to Shark Exchange."""
     global ACTIVE_SL_CLIENT_IDS
     try:
         if ref_price > 0:
             if side == "SELL" and stop_price >= ref_price:
-                print(f"[GUARD] Long SL {stop_price} >= Entry {ref_price}. Skipping.")
+                print(f"[GUARD] Long SL {stop_price} >= Price {ref_price}. Skipping.")
                 return
             if side == "BUY" and stop_price <= ref_price:
-                print(f"[GUARD] Short SL {stop_price} <= Entry {ref_price}. Skipping.")
+                print(f"[GUARD] Short SL {stop_price} <= Price {ref_price}. Skipping.")
                 return
 
         time.sleep(0.15)
@@ -171,7 +169,7 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
         print(f"[SL SUBMIT] Placing {side} STOP_LIMIT @ Stop: {stop_price}, Limit: {limit_price}, Qty: {quantity}")
         resp = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=sl_body, headers=sl_headers, timeout=5)
-        
+
         if resp.status_code in [200, 201]:
             res_data = resp.json()
             cid = res_data.get("clientOrderId") or res_data.get("data", {}).get("clientOrderId")
@@ -186,16 +184,15 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
 def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: float, trade_id: int):
     """
-    Background worker: monitors Shark Exchange until the Limit Entry fills.
-    - If filled: places the +/- 100 pt initial Stop Loss.
-    - If timeout occurs without a fill: cancels the resting limit order.
+    Monitors position on exchange until filled, then sets +/- 100 pt Stop-Limit.
+    Cancels unfilled entry orders on timeout.
     """
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE
     is_buy = target_side == "BUY"
 
     print(f"[WATCHER] Polling Shark Exchange for {target_side} fill @ {entry_price}...")
 
-    # 120 cycles * 2.0s = 240s (4 minutes)
+    # 120 cycles * 2.0s = 240 seconds (4 minutes timeout)
     for _ in range(120):
         time.sleep(2.0)
         if CURRENT_TRADE_ID != trade_id:
@@ -203,8 +200,6 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
             return
 
         current_pos = get_real_exchange_position(clean_symbol)
-
-        # Detect position fill in intended direction
         is_filled = (is_buy and current_pos > 0.00001) or (not is_buy and current_pos < -0.00001)
 
         if is_filled:
@@ -222,7 +217,7 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
             place_stop_loss(clean_symbol, sl_side, actual_qty, initial_stop, entry_price)
             return
 
-    # Check position one last time before canceling to prevent race-condition HTTP 400s
+    # Check one final time before triggering timeout cancel
     final_pos = get_real_exchange_position(clean_symbol)
     if (is_buy and final_pos > 0.00001) or (not is_buy and final_pos < -0.00001):
         actual_qty = round(abs(final_pos), 4)
@@ -245,7 +240,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
             target_qty = float(quantity)
 
-            # Step 1: Clean up resting stops and previous unfilled limit orders
+            # Step 1: Cleanup existing orders
             cancel_pending_limit_entry()
             cancel_all_tracked_stops()
 
@@ -264,7 +259,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             exec_qty = round(abs(diff), 4)
             CURRENT_TRADE_ID = trade_id
 
-            # Step 2: Post LIMIT Entry Order to Shark Exchange
+            # Step 2: Submit Limit Order
             entry_params = {
                 "timestamp": str(int(time.time() * 1000)),
                 "placeType": "ORDER_FORM",
