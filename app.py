@@ -68,26 +68,72 @@ def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
         return False
 
 
-def get_position_entry_price(symbol: str, fallback_price: float) -> float:
-    """Queries Shark Exchange active position to get the exact blue-line entry price."""
-    try:
-        ts = str(int(time.time() * 1000))
-        query_str = f"timestamp={ts}"
-        headers = get_headers(query_str)
+def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: float) -> float:
+    """
+    Directly queries execution receipts via order-detail and trade-history
+    to retrieve the exact fill price matched by the exchange engine.
+    """
+    for attempt in range(4):
+        try:
+            ts = str(int(time.time() * 1000))
+            # 1. Check order details directly
+            query_str = f"clientOrderId={client_order_id}&symbol={symbol}&timestamp={ts}"
+            headers = get_headers(query_str)
+            resp = requests.get(f"{SHARK_BASE_URL}/v1/order/order-detail?{query_str}", headers=headers, timeout=5)
 
-        resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{query_str}", headers=headers, timeout=5)
-        if resp.status_code == 200:
-            res_data = resp.json()
-            positions = res_data.get("data", []) if isinstance(res_data, dict) else res_data
-            for pos in positions:
-                pos_sym = pos.get("symbol", "").replace(".P", "").replace("-", "").upper()
-                clean_sym = symbol.replace(".P", "").replace("-", "").upper()
-                if pos_sym == clean_sym:
-                    entry_p = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
-                    if entry_p > 0:
-                        return entry_p
-    except Exception as e:
-        print(f"[FETCH POSITION ENTRY ERROR]: {e}")
+            if resp.status_code == 200:
+                res_data = resp.json()
+                data = res_data.get("data", res_data)
+                if isinstance(data, dict):
+                    # Check for explicit executed/average fill prices
+                    fill_p = float(data.get("avgPrice") or data.get("avgFillPrice") or data.get("executedPrice") or 0.0)
+                    if fill_p > 0:
+                        return fill_p
+
+            # 2. Check trade execution history
+            ts2 = str(int(time.time() * 1000))
+            query_str2 = f"symbol={symbol}&timestamp={ts2}"
+            headers2 = get_headers(query_str2)
+            resp2 = requests.get(f"{SHARK_BASE_URL}/v1/order/trade-history?{query_str2}", headers=headers2, timeout=5)
+
+            if resp2.status_code == 200:
+                trades_data = resp2.json()
+                trades = trades_data.get("data", trades_data) if isinstance(trades_data, dict) else trades_data
+                if isinstance(trades, list) and len(trades) > 0:
+                    for trade in trades:
+                        t_cid = str(trade.get("clientOrderId", "") or trade.get("orderId", ""))
+                        if client_order_id in t_cid or t_cid in client_order_id:
+                            trade_price = float(trade.get("price") or trade.get("executedPrice") or 0.0)
+                            if trade_price > 0:
+                                return trade_price
+                    # Fallback to the most recent filled trade in the list
+                    latest_price = float(trades[0].get("price") or trades[0].get("executedPrice") or 0.0)
+                    if latest_price > 0:
+                        return latest_price
+
+            # 3. Check active positions endpoint
+            ts3 = str(int(time.time() * 1000))
+            query_str3 = f"timestamp={ts3}"
+            headers3 = get_headers(query_str3)
+            resp3 = requests.get(f"{SHARK_BASE_URL}/v1/positions?{query_str3}", headers=headers3, timeout=5)
+
+            if resp3.status_code == 200:
+                pos_data = resp3.json()
+                positions = pos_data.get("data", pos_data) if isinstance(pos_data, dict) else pos_data
+                if isinstance(positions, list):
+                    for pos in positions:
+                        pos_sym = pos.get("symbol", "").replace(".P", "").replace("-", "").upper()
+                        if pos_sym == symbol:
+                            pos_entry = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
+                            if pos_entry > 0:
+                                return pos_entry
+
+        except Exception as e:
+            print(f"[FETCH FILL PRICE ATTEMPT {attempt + 1} ERROR]: {e}")
+
+        time.sleep(0.7)
+
+    print(f"[WARN] Unable to extract fill price from API, falling back to: {fallback_price}")
     return fallback_price
 
 
@@ -179,8 +225,8 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
 def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: float, trade_id: int, quantity: float):
     """
-    Monitors entry order execution. Upon fill, retrieves the true executed entry
-    price from Shark Exchange positions table to place the exact 100-point stop loss.
+    Monitors entry order execution. Upon fill, queries the exact fill execution
+    receipt to calculate and submit a true 100-point stop loss.
     """
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, ACTIVE_ENTRY_ORDER_ID
     is_buy = target_side == "BUY"
@@ -200,13 +246,14 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
         still_open = is_entry_order_open(ACTIVE_ENTRY_ORDER_ID, clean_symbol)
 
         if not still_open:
-            # Give exchange risk engine a moment to update the position entry price
-            time.sleep(0.5)
-            real_fill_price = get_position_entry_price(clean_symbol, entry_price)
-            print(f">>> [LIMIT FILLED] Real Position Price: {real_fill_price}. Placing initial 100pt Stop-Limit...")
+            print(f">>> [LIMIT FILLED] Fetching true executed fill price...")
             CURRENT_POSITION_SIDE = target_side
 
-            # Calculate SL directly from actual filled position price
+            # Extract true filled execution price across exchange receipts
+            real_fill_price = get_actual_fill_price(ACTIVE_ENTRY_ORDER_ID, clean_symbol, entry_price)
+            print(f">>> [EXECUTION CONFIRMED] Real Entry Price: {real_fill_price}")
+
+            # Calculate exact 100-point offset from real entry
             initial_stop = round(real_fill_price - 100.0, 2) if is_buy else round(real_fill_price + 100.0, 2)
             sl_side = "SELL" if is_buy else "BUY"
 
