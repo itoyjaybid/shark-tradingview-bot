@@ -34,7 +34,7 @@ ORDER_EXECUTION_LOCK = threading.Lock()
 
 
 def generate_signature(secret: str, data: str) -> str:
-    """Computes HMAC-SHA256 signature for authentication."""
+    """Computes HMAC-SHA256 signature strictly on UTF-8 bytes."""
     return hmac.new(secret.encode("utf-8"), data.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -96,8 +96,9 @@ def delete_single_order(client_order_id: str) -> bool:
     """Cancels a specific resting order."""
     try:
         ts = str(int(time.time() * 1000))
-        payload = {"timestamp": ts, "clientOrderId": str(client_order_id)}
-        body = json.dumps(payload, separators=(",", ":"))
+        payload = {"clientOrderId": str(client_order_id), "timestamp": ts}
+        # sort_keys=True added to fix HTTP 403 signature mismatch
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         headers = get_headers(body)
 
         resp = requests.delete(f"{SHARK_BASE_URL}/v1/order/delete-order", data=body, headers=headers, timeout=5)
@@ -146,21 +147,22 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
         clean_qty = round(float(quantity), 4)
 
         sl_params = {
-            "timestamp": str(int(time.time() * 1000)),
-            "placeType": "ORDER_FORM",
-            "quantity": clean_qty,
-            "side": side,
-            "symbol": symbol,
-            "type": "STOP_LIMIT",
-            "price": limit_price,
-            "stopPrice": stop_price,
-            "reduceOnly": True,
-            "marginAsset": "INR",
             "deviceType": "WEB",
+            "marginAsset": "INR",
+            "placeType": "ORDER_FORM",
+            "price": limit_price,
+            "quantity": clean_qty,
+            "reduceOnly": True,
+            "side": side,
+            "stopPrice": stop_price,
+            "symbol": symbol,
+            "timestamp": str(int(time.time() * 1000)),
+            "type": "STOP_LIMIT",
             "userCategory": "EXTERNAL"
         }
 
-        sl_body = json.dumps(sl_params, separators=(",", ":"))
+        # sort_keys=True added to fix HTTP 403 signature mismatch
+        sl_body = json.dumps(sl_params, separators=(",", ":"), sort_keys=True)
         sl_headers = get_headers(sl_body)
 
         print(f"[SL SUBMIT] Placing {side} STOP_LIMIT @ Stop: {stop_price}, Limit: {limit_price}, Qty: {clean_qty}")
@@ -189,7 +191,7 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
     print(f"[WATCHER] Polling Shark Exchange for {target_side} fill...")
 
     # Wait up to 4 minutes (120 cycles * 2 seconds)
-    for _ in range(300):
+    for _ in range(120):
         time.sleep(2.0)
         if CURRENT_TRADE_ID != trade_id:
             print(f"[WATCHER] Trade {trade_id} superseded. Exiting.")
@@ -235,20 +237,21 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             CURRENT_TRADE_ID = trade_id
 
             entry_params = {
-                "timestamp": str(int(time.time() * 1000)),
+                "deviceType": "WEB",
+                "marginAsset": "INR",
                 "placeType": "ORDER_FORM",
+                "price": clean_price,
                 "quantity": target_qty,
+                "reduceOnly": False,
                 "side": side,
                 "symbol": clean_symbol,
+                "timestamp": str(int(time.time() * 1000)),
                 "type": "LIMIT",
-                "price": clean_price,
-                "reduceOnly": False,
-                "marginAsset": "INR",
-                "deviceType": "WEB",
                 "userCategory": "EXTERNAL"
             }
 
-            entry_body = json.dumps(entry_params, separators=(",", ":"))
+            # sort_keys=True added to fix HTTP 403 signature mismatch
+            entry_body = json.dumps(entry_params, separators=(",", ":"), sort_keys=True)
             entry_headers = get_headers(entry_body)
 
             print(f"\n[LIMIT ENTRY] Placing {side} {target_qty} {clean_symbol} @ Limit Price {clean_price}...")
