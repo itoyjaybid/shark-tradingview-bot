@@ -70,27 +70,34 @@ def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
 
 def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: float) -> float:
     """
-    Directly queries execution receipts via order-detail and trade-history
-    to retrieve the exact fill price matched by the exchange engine.
+    Normalizes symbols (handles BTC-USDT vs BTCUSDT) and queries active
+    positions and order execution history to retrieve the exact entry price.
     """
-    for attempt in range(4):
+    clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
+
+    for attempt in range(5):
+        time.sleep(1.0)
         try:
             ts = str(int(time.time() * 1000))
-            # 1. Check order details directly
-            query_str = f"clientOrderId={client_order_id}&symbol={symbol}&timestamp={ts}"
+            
+            # 1. Query active positions (exact chart blue line price)
+            query_str = f"timestamp={ts}"
             headers = get_headers(query_str)
-            resp = requests.get(f"{SHARK_BASE_URL}/v1/order/order-detail?{query_str}", headers=headers, timeout=5)
+            resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{query_str}", headers=headers, timeout=5)
 
             if resp.status_code == 200:
-                res_data = resp.json()
-                data = res_data.get("data", res_data)
-                if isinstance(data, dict):
-                    # Check for explicit executed/average fill prices
-                    fill_p = float(data.get("avgPrice") or data.get("avgFillPrice") or data.get("executedPrice") or 0.0)
-                    if fill_p > 0:
-                        return fill_p
+                pos_data = resp.json()
+                positions = pos_data.get("data", pos_data) if isinstance(pos_data, dict) else pos_data
+                if isinstance(positions, list):
+                    for pos in positions:
+                        raw_sym = str(pos.get("symbol", "")).replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
+                        if raw_sym == clean_target:
+                            entry_p = float(pos.get("entryPrice") or pos.get("avgCost") or pos.get("avgPrice") or 0.0)
+                            if entry_p > 0:
+                                print(f">>> [FOUND REAL ENTRY] Position entry price: {entry_p}")
+                                return entry_p
 
-            # 2. Check trade execution history
+            # 2. Query trade execution history as fallback
             ts2 = str(int(time.time() * 1000))
             query_str2 = f"symbol={symbol}&timestamp={ts2}"
             headers2 = get_headers(query_str2)
@@ -105,35 +112,13 @@ def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: flo
                         if client_order_id in t_cid or t_cid in client_order_id:
                             trade_price = float(trade.get("price") or trade.get("executedPrice") or 0.0)
                             if trade_price > 0:
+                                print(f">>> [FOUND REAL ENTRY] Trade history price: {trade_price}")
                                 return trade_price
-                    # Fallback to the most recent filled trade in the list
-                    latest_price = float(trades[0].get("price") or trades[0].get("executedPrice") or 0.0)
-                    if latest_price > 0:
-                        return latest_price
-
-            # 3. Check active positions endpoint
-            ts3 = str(int(time.time() * 1000))
-            query_str3 = f"timestamp={ts3}"
-            headers3 = get_headers(query_str3)
-            resp3 = requests.get(f"{SHARK_BASE_URL}/v1/positions?{query_str3}", headers=headers3, timeout=5)
-
-            if resp3.status_code == 200:
-                pos_data = resp3.json()
-                positions = pos_data.get("data", pos_data) if isinstance(pos_data, dict) else pos_data
-                if isinstance(positions, list):
-                    for pos in positions:
-                        pos_sym = pos.get("symbol", "").replace(".P", "").replace("-", "").upper()
-                        if pos_sym == symbol:
-                            pos_entry = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
-                            if pos_entry > 0:
-                                return pos_entry
 
         except Exception as e:
-            print(f"[FETCH FILL PRICE ATTEMPT {attempt + 1} ERROR]: {e}")
+            print(f"[FETCH ATTEMPT {attempt + 1} ERROR]: {e}")
 
-        time.sleep(0.7)
-
-    print(f"[WARN] Unable to extract fill price from API, falling back to: {fallback_price}")
+    print(f"[WARN] Failed to find live position for {clean_target}, falling back to: {fallback_price}")
     return fallback_price
 
 
@@ -324,6 +309,8 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
         try:
             clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
 
+            print(f"[UPDATE_SL] Requested SL: {sl_price} | Position Side: {CURRENT_POSITION_SIDE} | TradeID: {trade_id}")
+
             if CURRENT_TRADE_ID is not None and trade_id != CURRENT_TRADE_ID:
                 print(f"[DESYNC GUARD] Alert trade_id ({trade_id}) != current ({CURRENT_TRADE_ID}). Ignored.")
                 return
@@ -338,8 +325,11 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
 
             if stop_price > 0:
                 sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
+                print(f"[UPDATE_SL] Moving {sl_side} Stop to {stop_price}...")
                 cancel_all_tracked_stops()
                 place_stop_loss(clean_symbol, sl_side, clean_qty, stop_price, ref_price)
+            else:
+                print(f"[UPDATE_SL] Invalid stop price {stop_price}. Skipped.")
 
         except Exception as e:
             print(f"[TRAILING SL ERROR]: {e}")
@@ -370,7 +360,11 @@ async def receive_webhook(request: Request):
     sl_price = float(data.get("sl_price", 0.0))
     trade_id = int(data.get("trade_id", 0))
 
-    print(f"\n[ALERT RECEIVED] Action: {action} | Limit Price: {target_limit_price} | TradeID: {trade_id}")
+    # Automatic fallback: If TradingView sent the SL price in "price" instead of "sl_price"
+    if action == "UPDATE_SL" and sl_price == 0.0 and target_limit_price > 0.0:
+        sl_price = target_limit_price
+
+    print(f"\n[ALERT RECEIVED] Action: {action} | Limit/SL Price: {target_limit_price} | sl_price: {sl_price} | TradeID: {trade_id}")
 
     if action in ["BUY", "SELL"]:
         threading.Thread(
