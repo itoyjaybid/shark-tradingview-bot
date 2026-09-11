@@ -294,7 +294,7 @@ async def receive_webhook(request: Request):
 
     action = str(data.get("action", "")).upper()
     symbol = str(data.get("symbol", "BTCUSDT"))
-    quantity = float(data.get("quantity", 0.05))
+    quantity = float(data.get("quantity", 0.002))
     target_limit_price = float(data.get("price", 0.0))
     sl_price = float(data.get("sl_price", 0.0))
     trade_id = int(data.get("trade_id", 0))
