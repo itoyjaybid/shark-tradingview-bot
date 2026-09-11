@@ -9,7 +9,7 @@ import requests
 import threading
 import urllib3.util.connection as urllib3_cn
 
-# Force IPv4 resolution on cloud environments (Render, Railway, etc.)
+# Force IPv4 resolution on cloud environments
 def allowed_gai_family():
     return socket.AF_INET
 
@@ -34,7 +34,7 @@ ORDER_EXECUTION_LOCK = threading.Lock()
 
 
 def generate_signature(secret: str, data: str) -> str:
-    """Computes HMAC-SHA256 signature on query string (GET) or body (POST/DELETE)."""
+    """Computes HMAC-SHA256 signature for authentication."""
     return hmac.new(secret.encode("utf-8"), data.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -104,7 +104,7 @@ def cancel_pending_limit_entry():
 
 
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0):
-    """Submits a STOP_LIMIT order with INR marginAsset and string-formatted values."""
+    """Submits a STOP_LIMIT order with numeric float types."""
     global ACTIVE_SL_CLIENT_IDS
     try:
         if ref_price > 0:
@@ -119,16 +119,17 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
         offset = 15.0
         limit_price = round(stop_price - offset, 2) if side == "SELL" else round(stop_price + offset, 2)
         stop_price = round(stop_price, 2)
+        clean_qty = round(float(quantity), 4)
 
         sl_params = {
             "timestamp": str(int(time.time() * 1000)),
             "placeType": "ORDER_FORM",
-            "quantity": f"{float(quantity):.4f}",
+            "quantity": clean_qty,
             "side": side,
             "symbol": symbol,
             "type": "STOP_LIMIT",
-            "price": f"{limit_price:.2f}",
-            "stopPrice": f"{stop_price:.2f}",
+            "price": limit_price,
+            "stopPrice": stop_price,
             "reduceOnly": True,
             "marginAsset": "INR",
             "deviceType": "WEB",
@@ -138,7 +139,7 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
         sl_body = json.dumps(sl_params, separators=(",", ":"))
         sl_headers = get_headers(sl_body)
 
-        print(f"[SL SUBMIT] Placing {side} STOP_LIMIT @ Stop: {stop_price}, Limit: {limit_price}, Qty: {quantity}")
+        print(f"[SL SUBMIT] Placing {side} STOP_LIMIT @ Stop: {stop_price}, Limit: {limit_price}, Qty: {clean_qty}")
         resp = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=sl_body, headers=sl_headers, timeout=5)
 
         if resp.status_code in [200, 201]:
@@ -172,7 +173,6 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
 
         still_open = is_entry_order_open(ACTIVE_ENTRY_ORDER_ID, clean_symbol)
 
-        # If it is no longer in open orders, the limit order filled
         if not still_open:
             print(f">>> [LIMIT FILLED] Entry order filled. Placing initial Stop-Limit...")
             CURRENT_POSITION_SIDE = target_side
@@ -194,9 +194,9 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
     with ORDER_EXECUTION_LOCK:
         try:
             clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
-            target_qty = float(quantity)
+            target_qty = round(float(quantity), 4)
+            clean_price = round(float(target_limit_price), 2)
 
-            # Cancel previous resting stops and unfilled limit orders
             cancel_pending_limit_entry()
             cancel_all_tracked_stops()
 
@@ -207,11 +207,11 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             entry_params = {
                 "timestamp": str(int(time.time() * 1000)),
                 "placeType": "ORDER_FORM",
-                "quantity": f"{target_qty:.4f}",
+                "quantity": target_qty,
                 "side": side,
                 "symbol": clean_symbol,
                 "type": "LIMIT",
-                "price": f"{round(target_limit_price, 2):.2f}",
+                "price": clean_price,
                 "reduceOnly": False,
                 "marginAsset": "INR",
                 "deviceType": "WEB",
@@ -221,7 +221,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             entry_body = json.dumps(entry_params, separators=(",", ":"))
             entry_headers = get_headers(entry_body)
 
-            print(f"\n[LIMIT ENTRY] Placing {side} {target_qty:.4f} {clean_symbol} @ Limit Price {target_limit_price:.2f}...")
+            print(f"\n[LIMIT ENTRY] Placing {side} {target_qty} {clean_symbol} @ Limit Price {clean_price}...")
             resp_entry = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=entry_body, headers=entry_headers, timeout=5)
 
             if resp_entry.status_code in [200, 201]:
@@ -231,7 +231,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
                 threading.Thread(
                     target=wait_for_fill_and_set_sl,
-                    args=(clean_symbol, side, target_limit_price, trade_id, target_qty),
+                    args=(clean_symbol, side, clean_price, trade_id, target_qty),
                     daemon=True
                 ).start()
             else:
@@ -255,13 +255,14 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
                 print(f"[REJECTED UPDATE_SL] No open trade active on exchange. Discarding trail.")
                 return
 
+            clean_qty = round(float(quantity), 4)
             stop_price = round(float(sl_price), 2)
             ref_price = float(current_price) if current_price else 0.0
 
             if stop_price > 0:
                 sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
                 cancel_all_tracked_stops()
-                place_stop_loss(clean_symbol, sl_side, quantity, stop_price, ref_price)
+                place_stop_loss(clean_symbol, sl_side, clean_qty, stop_price, ref_price)
 
         except Exception as e:
             print(f"[TRAILING SL ERROR]: {e}")
@@ -271,7 +272,7 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
 # FASTAPI ENDPOINTS
 # ==========================================
 @app.api_route("/", methods=["GET", "HEAD"])
-def home():
+async def home():
     return {"status": "awake", "service": "Shark Trading Bot"}
 
 
@@ -313,5 +314,5 @@ async def receive_webhook(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     uvicorn.run("app:app", host="0.0.0.0", port=port)
