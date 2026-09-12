@@ -34,14 +34,15 @@ ORDER_EXECUTION_LOCK = threading.Lock()
 
 
 def generate_signature(secret: str, data: str) -> str:
-    """Computes HMAC-SHA256 signature strictly on UTF-8 bytes."""
+    """Computes HMAC-SHA256 signature strictly on raw UTF-8 bytes."""
     return hmac.new(secret.encode("utf-8"), data.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def get_headers(payload_or_querystr: str) -> dict:
+    sig = generate_signature(SHARK_API_SECRET, payload_or_querystr)
     return {
         "api-key": SHARK_API_KEY,
-        "signature": generate_signature(SHARK_API_SECRET, payload_or_querystr),
+        "signature": sig,
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
     }
@@ -69,37 +70,33 @@ def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
 
 
 def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: float) -> float:
-    """
-    Normalizes symbols (handles BTC-USDT vs BTCUSDT) and queries active
-    positions and order execution history to retrieve the exact entry price.
-    """
+    """Queries positions and trade history to extract the exact executed fill price."""
     clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
+    hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
 
     for attempt in range(5):
         time.sleep(1.0)
         try:
-            ts = str(int(time.time() * 1000))
-            
-            # 1. Query active positions (exact chart blue line price)
-            query_str = f"timestamp={ts}"
-            headers = get_headers(query_str)
-            resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{query_str}", headers=headers, timeout=5)
+            for sym_variant in [hyphen_target, clean_target, ""]:
+                ts_pos = str(int(time.time() * 1000))
+                q = f"symbol={sym_variant}&timestamp={ts_pos}" if sym_variant else f"timestamp={ts_pos}"
+                headers = get_headers(q)
+                resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q}", headers=headers, timeout=5)
 
-            if resp.status_code == 200:
-                pos_data = resp.json()
-                positions = pos_data.get("data", pos_data) if isinstance(pos_data, dict) else pos_data
-                if isinstance(positions, list):
-                    for pos in positions:
-                        raw_sym = str(pos.get("symbol", "")).replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
-                        if raw_sym == clean_target:
-                            entry_p = float(pos.get("entryPrice") or pos.get("avgCost") or pos.get("avgPrice") or 0.0)
-                            if entry_p > 0:
-                                print(f">>> [FOUND REAL ENTRY] Position entry price: {entry_p}")
-                                return entry_p
+                if resp.status_code == 200:
+                    pos_data = resp.json()
+                    positions = pos_data.get("data", pos_data) if isinstance(pos_data, dict) else pos_data
+                    if isinstance(positions, list):
+                        for pos in positions:
+                            raw_sym = str(pos.get("symbol", "")).replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
+                            if raw_sym == clean_target:
+                                entry_p = float(pos.get("entryPrice") or pos.get("avgCost") or pos.get("avgPrice") or pos.get("price") or 0.0)
+                                if entry_p > 0:
+                                    print(f">>> [FOUND REAL ENTRY] Position entry price: {entry_p}")
+                                    return entry_p
 
-            # 2. Query trade execution history as fallback
             ts2 = str(int(time.time() * 1000))
-            query_str2 = f"symbol={symbol}&timestamp={ts2}"
+            query_str2 = f"symbol={hyphen_target}&timestamp={ts2}"
             headers2 = get_headers(query_str2)
             resp2 = requests.get(f"{SHARK_BASE_URL}/v1/order/trade-history?{query_str2}", headers=headers2, timeout=5)
 
@@ -130,7 +127,12 @@ def delete_single_order(client_order_id: str) -> bool:
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         headers = get_headers(body)
 
-        resp = requests.delete(f"{SHARK_BASE_URL}/v1/order/delete-order", data=body, headers=headers, timeout=5)
+        resp = requests.delete(
+            f"{SHARK_BASE_URL}/v1/order/delete-order",
+            data=body.encode("utf-8"),
+            headers=headers,
+            timeout=5
+        )
         print(f"[CLEANUP] Canceled order ({client_order_id}) -> HTTP {resp.status_code} | Body: {resp.text.strip()}")
         return resp.status_code in [200, 201, 204]
     except Exception as e:
@@ -158,7 +160,7 @@ def cancel_pending_limit_entry():
 
 
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0):
-    """Submits a STOP_LIMIT order with numeric float types."""
+    """Submits a STOP_LIMIT order with exact byte signature parity."""
     global ACTIVE_SL_CLIENT_IDS
     try:
         if ref_price > 0:
@@ -169,11 +171,12 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
                 print(f"[GUARD] Short SL {stop_price} <= Price {ref_price}. Skipping.")
                 return
 
-        time.sleep(0.15)
         offset = 15.0
         limit_price = round(stop_price - offset, 2) if side == "SELL" else round(stop_price + offset, 2)
         stop_price = round(stop_price, 2)
         clean_qty = round(float(quantity), 4)
+
+        ts = str(int(time.time() * 1000))
 
         sl_params = {
             "deviceType": "WEB",
@@ -185,7 +188,7 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
             "side": side,
             "stopPrice": stop_price,
             "symbol": symbol,
-            "timestamp": str(int(time.time() * 1000)),
+            "timestamp": ts,
             "type": "STOP_LIMIT",
             "userCategory": "EXTERNAL"
         }
@@ -194,7 +197,12 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
         sl_headers = get_headers(sl_body)
 
         print(f"[SL SUBMIT] Placing {side} STOP_LIMIT @ Stop: {stop_price}, Limit: {limit_price}, Qty: {clean_qty}")
-        resp = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=sl_body, headers=sl_headers, timeout=5)
+        resp = requests.post(
+            f"{SHARK_BASE_URL}/v1/order/place-order",
+            data=sl_body.encode("utf-8"),
+            headers=sl_headers,
+            timeout=5
+        )
 
         if resp.status_code in [200, 201]:
             res_data = resp.json()
@@ -209,16 +217,11 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
 
 def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: float, trade_id: int, quantity: float):
-    """
-    Monitors entry order execution. Upon fill, queries the exact fill execution
-    receipt to calculate and submit a true 100-point stop loss.
-    """
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, ACTIVE_ENTRY_ORDER_ID
     is_buy = target_side == "BUY"
 
     print(f"[WATCHER] Polling Shark Exchange for {target_side} fill...")
 
-    # Wait up to 4 minutes (120 cycles * 2 seconds)
     for _ in range(300):
         time.sleep(2.0)
         if CURRENT_TRADE_ID != trade_id:
@@ -234,11 +237,9 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
             print(f">>> [LIMIT FILLED] Fetching true executed fill price...")
             CURRENT_POSITION_SIDE = target_side
 
-            # Extract true filled execution price across exchange receipts
             real_fill_price = get_actual_fill_price(ACTIVE_ENTRY_ORDER_ID, clean_symbol, entry_price)
             print(f">>> [EXECUTION CONFIRMED] Real Entry Price: {real_fill_price}")
 
-            # Calculate exact 100-point offset from real entry
             initial_stop = round(real_fill_price - 100.0, 2) if is_buy else round(real_fill_price + 100.0, 2)
             sl_side = "SELL" if is_buy else "BUY"
 
@@ -266,6 +267,8 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             side = "BUY" if is_buy_intent else "SELL"
             CURRENT_TRADE_ID = trade_id
 
+            ts = str(int(time.time() * 1000))
+
             entry_params = {
                 "deviceType": "WEB",
                 "marginAsset": "INR",
@@ -275,7 +278,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
                 "reduceOnly": False,
                 "side": side,
                 "symbol": clean_symbol,
-                "timestamp": str(int(time.time() * 1000)),
+                "timestamp": ts,
                 "type": "LIMIT",
                 "userCategory": "EXTERNAL"
             }
@@ -284,7 +287,12 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             entry_headers = get_headers(entry_body)
 
             print(f"\n[LIMIT ENTRY] Placing {side} {target_qty} {clean_symbol} @ Limit Price {clean_price}...")
-            resp_entry = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=entry_body, headers=entry_headers, timeout=5)
+            resp_entry = requests.post(
+                f"{SHARK_BASE_URL}/v1/order/place-order",
+                data=entry_body.encode("utf-8"),
+                headers=entry_headers,
+                timeout=5
+            )
 
             if resp_entry.status_code in [200, 201]:
                 res_data = resp_entry.json()
@@ -360,7 +368,6 @@ async def receive_webhook(request: Request):
     sl_price = float(data.get("sl_price", 0.0))
     trade_id = int(data.get("trade_id", 0))
 
-    # Automatic fallback: If TradingView sent the SL price in "price" instead of "sl_price"
     if action == "UPDATE_SL" and sl_price == 0.0 and target_limit_price > 0.0:
         sl_price = target_limit_price
 
