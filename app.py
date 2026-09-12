@@ -25,6 +25,9 @@ SHARK_API_KEY = os.getenv("SHARK_API_KEY", "").strip()
 SHARK_API_SECRET = os.getenv("SHARK_API_SECRET", "").strip()
 WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MY_SECRET_KEY").strip()
 
+# Order entry expiration timeout in seconds (4.5 mins = 270s for a 5m chart)
+ENTRY_ORDER_EXPIRATION_SECONDS = 600
+
 CURRENT_TRADE_ID = None
 CURRENT_POSITION_SIDE = None
 ACTIVE_SL_CLIENT_IDS = []
@@ -115,7 +118,7 @@ def get_active_position_details(symbol: str):
 
 
 def emergency_market_close(symbol: str, side: str, quantity: float):
-    """Executes a market order to close out immediately."""
+    """Executes an immediate market order with reduceOnly=True."""
     try:
         ts = str(int(time.time() * 1000))
         close_params = {
@@ -183,6 +186,7 @@ def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, l
 
 
 def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: float) -> float:
+    """Queries active positions and trade history to capture the real filled entry price."""
     clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
     hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
 
@@ -332,13 +336,18 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
 
 def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: float, trade_id: int, quantity: float):
+    """
+    Monitors limit order execution with an automatic time-based cancellation cutoff.
+    """
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, ACTIVE_ENTRY_ORDER_ID
     is_buy = target_side == "BUY"
+    poll_interval = 2.0
+    max_cycles = int(ENTRY_ORDER_EXPIRATION_SECONDS / poll_interval)
 
-    print(f"[WATCHER] Polling Shark Exchange for {target_side} fill...")
+    print(f"[WATCHER] Polling Shark Exchange for {target_side} fill (Timeout: {ENTRY_ORDER_EXPIRATION_SECONDS}s)...")
 
-    for _ in range(300):
-        time.sleep(2.0)
+    for cycle in range(max_cycles):
+        time.sleep(poll_interval)
         if CURRENT_TRADE_ID != trade_id:
             print(f"[WATCHER] Trade {trade_id} superseded. Exiting.")
             return
@@ -361,7 +370,8 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
             place_stop_loss(clean_symbol, sl_side, quantity, initial_stop, real_fill_price)
             return
 
-    print(f"[WATCHER] Limit order timed out without fill. Canceling...")
+    # Time-based order expiry
+    print(f"[WATCHER] Limit order timed out after {ENTRY_ORDER_EXPIRATION_SECONDS}s without filling. Canceling order...")
     with ORDER_EXECUTION_LOCK:
         cancel_pending_limit_entry()
         CURRENT_POSITION_SIDE = None
@@ -375,11 +385,11 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             clean_price = float(f"{target_limit_price:.2f}")
             clean_qty = float(f"{quantity:.4f}")
 
-            # Step 1: Remove pending entry orders and existing stop-loss orders
+            # 1. Remove previous pending orders and active stops
             cancel_pending_limit_entry()
             cancel_all_tracked_stops()
 
-            # Step 2: Auto-Reversal check - close active trade at market
+            # 2. Auto-Reversal check: close existing opposite trade at market
             close_position_immediately(clean_symbol)
 
             is_buy_intent = "BUY" in action.upper()
