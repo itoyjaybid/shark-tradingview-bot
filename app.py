@@ -25,7 +25,7 @@ SHARK_API_KEY = os.getenv("SHARK_API_KEY", "").strip()
 SHARK_API_SECRET = os.getenv("SHARK_API_SECRET", "").strip()
 WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MY_SECRET_KEY").strip()
 
-# Order entry expiration timeout in seconds (4.5 mins = 270s for a 5m chart)
+# Order entry expiration timeout in seconds (10 minutes = 600s)
 ENTRY_ORDER_EXPIRATION_SECONDS = 600
 
 CURRENT_TRADE_ID = None
@@ -54,18 +54,22 @@ def get_headers(payload_or_querystr: str) -> dict:
 def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
     """Checks whether an entry order is still resting on the order book."""
     try:
+        clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
+        hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
         ts = str(int(time.time() * 1000))
-        query_str = f"symbol={symbol}&timestamp={ts}"
-        headers = get_headers(query_str)
 
-        resp = requests.get(f"{SHARK_BASE_URL}/v1/order/open-orders?{query_str}", headers=headers, timeout=5)
-        if resp.status_code == 200:
-            res_json = resp.json()
-            orders = res_json.get("data", []) if isinstance(res_json, dict) else res_json
-            for o in orders:
-                cid = str(o.get("clientOrderId", "") or o.get("orderId", ""))
-                if client_order_id in cid or cid in client_order_id:
-                    return True
+        for sym_var in [hyphen_target, clean_target]:
+            query_str = f"symbol={sym_var}&timestamp={ts}"
+            headers = get_headers(query_str)
+            resp = requests.get(f"{SHARK_BASE_URL}/v1/order/open-orders?{query_str}", headers=headers, timeout=5)
+            if resp.status_code == 200:
+                res_json = resp.json()
+                orders = res_json.get("data", []) if isinstance(res_json, dict) else res_json
+                if isinstance(orders, list):
+                    for o in orders:
+                        cid = str(o.get("clientOrderId", "") or o.get("orderId", ""))
+                        if client_order_id in cid or cid in client_order_id:
+                            return True
         return False
     except Exception as e:
         print(f"[STATUS CHECK ERROR]: {e}")
@@ -75,14 +79,20 @@ def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
 def get_current_market_price(symbol: str) -> float:
     """Fetches the latest live market price."""
     try:
+        clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
+        hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
         ts = str(int(time.time() * 1000))
-        query_str = f"symbol={symbol}&timestamp={ts}"
-        headers = get_headers(query_str)
-        resp = requests.get(f"{SHARK_BASE_URL}/v1/ticker/price?{query_str}", headers=headers, timeout=3)
-        if resp.status_code == 200:
-            res_data = resp.json()
-            data = res_data.get("data", res_data)
-            return float(data.get("price") or data.get("lastPrice") or 0.0)
+
+        for sym_var in [hyphen_target, clean_target]:
+            query_str = f"symbol={sym_var}&timestamp={ts}"
+            headers = get_headers(query_str)
+            resp = requests.get(f"{SHARK_BASE_URL}/v1/ticker/price?{query_str}", headers=headers, timeout=3)
+            if resp.status_code == 200:
+                res_data = resp.json()
+                data = res_data.get("data", res_data)
+                price = float(data.get("price") or data.get("lastPrice") or 0.0)
+                if price > 0:
+                    return price
     except Exception as e:
         print(f"[TICKER FETCH ERROR]: {e}")
     return 0.0
@@ -90,37 +100,44 @@ def get_current_market_price(symbol: str) -> float:
 
 def get_active_position_details(symbol: str):
     """
-    Returns (position_size, side) for the symbol.
+    Queries Shark Exchange with both hyphenated and plain symbol formats.
+    Returns (position_size, side).
     size: positive float (e.g. 0.002).
     side: 'BUY' (Long) or 'SELL' (Short) or None.
     """
     try:
         clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
+        hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
         ts = str(int(time.time() * 1000))
-        query_str = f"timestamp={ts}"
-        headers = get_headers(query_str)
-        resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{query_str}", headers=headers, timeout=5)
 
-        if resp.status_code == 200:
-            pos_data = resp.json()
-            positions = pos_data.get("data", pos_data) if isinstance(pos_data, dict) else pos_data
-            if isinstance(positions, list):
-                for pos in positions:
-                    raw_sym = str(pos.get("symbol", "")).replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
-                    if raw_sym == clean_target:
-                        amt = float(pos.get("positionAmt") or pos.get("size") or pos.get("contractVal") or 0.0)
-                        if amt != 0:
-                            pos_side = "BUY" if amt > 0 else "SELL"
-                            return abs(amt), pos_side
+        for q in [f"symbol={hyphen_target}&timestamp={ts}", f"timestamp={ts}", f"symbol={clean_target}&timestamp={ts}"]:
+            headers = get_headers(q)
+            resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q}", headers=headers, timeout=4)
+
+            if resp.status_code == 200:
+                pos_data = resp.json()
+                positions = pos_data.get("data", pos_data) if isinstance(pos_data, dict) else pos_data
+                if isinstance(positions, list):
+                    for pos in positions:
+                        raw_sym = str(pos.get("symbol", "")).replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
+                        if raw_sym == clean_target:
+                            amt = float(pos.get("positionAmt") or pos.get("size") or pos.get("contractVal") or 0.0)
+                            if amt != 0:
+                                pos_side = "BUY" if amt > 0 else "SELL"
+                                print(f">>> [POSITION DETECTED] Found active {pos_side} position: {abs(amt)} {raw_sym}")
+                                return abs(amt), pos_side
     except Exception as e:
         print(f"[POSITION DETAIL CHECK ERROR]: {e}")
     return 0.0, None
 
 
 def emergency_market_close(symbol: str, side: str, quantity: float):
-    """Executes an immediate market order with reduceOnly=True."""
+    """Executes an immediate market order with reduceOnly=True to liquidate an open position."""
     try:
+        clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
+        hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
         ts = str(int(time.time() * 1000))
+
         close_params = {
             "deviceType": "WEB",
             "marginAsset": "INR",
@@ -128,7 +145,7 @@ def emergency_market_close(symbol: str, side: str, quantity: float):
             "quantity": float(f"{quantity:.4f}"),
             "reduceOnly": True,
             "side": side,
-            "symbol": symbol,
+            "symbol": hyphen_target,
             "timestamp": ts,
             "type": "MARKET",
             "userCategory": "EXTERNAL"
@@ -142,7 +159,7 @@ def emergency_market_close(symbol: str, side: str, quantity: float):
             headers=headers,
             timeout=5
         )
-        print(f">>> [MARKET CLOSE RESULT HTTP {resp.status_code}]: {resp.text.strip()}")
+        print(f">>> [MARKET FLATTEN RESULT HTTP {resp.status_code}]: {resp.text.strip()}")
     except Exception as e:
         print(f"[EMERGENCY CLOSE ERROR]: {e}")
 
@@ -152,9 +169,9 @@ def close_position_immediately(symbol: str):
     size, side = get_active_position_details(symbol)
     if size > 0 and side:
         close_side = "SELL" if side == "BUY" else "BUY"
-        print(f"[AUTO-REVERSAL FLATTEN] Closing previous {side} position ({size} BTC) via {close_side} MARKET order...")
+        print(f"[AUTO-REVERSAL FLATTEN] Closing prior {side} position ({size} BTC) via {close_side} MARKET order...")
         emergency_market_close(symbol, close_side, size)
-        time.sleep(1.0)
+        time.sleep(1.5)
 
 
 def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, limit_price: float, sl_client_id: str, trade_id: int):
@@ -172,11 +189,11 @@ def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, l
         spike_long_breached = (not is_buying_back) and (curr_price < limit_price)
 
         if spike_short_breached or spike_long_breached:
-            print(f"\n[SPIKE DETECTED] Price ({curr_price}) blew past Limit ({limit_price})!")
+            print(f"\n[SPIKE DETECTED] Price ({curr_price}) breached limit ceiling ({limit_price})!")
             with ORDER_EXECUTION_LOCK:
                 size, _ = get_active_position_details(symbol)
                 if size > 0:
-                    print(f"[EMERGENCY ACTIVATED] Liquidating with Market Order...")
+                    print(f"[EMERGENCY ACTIVATED] Liquidating immediately via Market Order...")
                     cancel_all_tracked_stops()
                     emergency_market_close(symbol, side, quantity)
                     CURRENT_POSITION_SIDE = None
@@ -275,6 +292,9 @@ def cancel_pending_limit_entry():
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0):
     global ACTIVE_SL_CLIENT_IDS, CURRENT_TRADE_ID
     try:
+        clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
+        hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
+
         if ref_price > 0:
             if side == "SELL" and stop_price >= ref_price:
                 print(f"[GUARD] Long SL {stop_price} >= Price {ref_price}. Skipping.")
@@ -300,7 +320,7 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
             "reduceOnly": True,
             "side": side,
             "stopPrice": clean_stop_price,
-            "symbol": symbol,
+            "symbol": hyphen_target,
             "timestamp": ts,
             "type": "STOP_LIMIT",
             "userCategory": "EXTERNAL"
@@ -326,7 +346,7 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
                 threading.Thread(
                     target=monitor_slippage_and_market_close,
-                    args=(symbol, side, clean_qty, clean_limit_price, cid, CURRENT_TRADE_ID),
+                    args=(clean_target, side, clean_qty, clean_limit_price, cid, CURRENT_TRADE_ID),
                     daemon=True
                 ).start()
         else:
@@ -341,13 +361,12 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
     """
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, ACTIVE_ENTRY_ORDER_ID
     is_buy = target_side == "BUY"
-    poll_interval = 2.0
-    max_cycles = int(ENTRY_ORDER_EXPIRATION_SECONDS / poll_interval)
+    start_time = time.time()
 
     print(f"[WATCHER] Polling Shark Exchange for {target_side} fill (Timeout: {ENTRY_ORDER_EXPIRATION_SECONDS}s)...")
 
-    for cycle in range(max_cycles):
-        time.sleep(poll_interval)
+    while (time.time() - start_time) < ENTRY_ORDER_EXPIRATION_SECONDS:
+        time.sleep(2.0)
         if CURRENT_TRADE_ID != trade_id:
             print(f"[WATCHER] Trade {trade_id} superseded. Exiting.")
             return
@@ -370,7 +389,6 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
             place_stop_loss(clean_symbol, sl_side, quantity, initial_stop, real_fill_price)
             return
 
-    # Time-based order expiry
     print(f"[WATCHER] Limit order timed out after {ENTRY_ORDER_EXPIRATION_SECONDS}s without filling. Canceling order...")
     with ORDER_EXECUTION_LOCK:
         cancel_pending_limit_entry()
@@ -382,10 +400,11 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
     with ORDER_EXECUTION_LOCK:
         try:
             clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
+            hyphen_symbol = f"{clean_symbol[:-4]}-{clean_symbol[-4:]}" if clean_symbol.endswith("USDT") else clean_symbol
             clean_price = float(f"{target_limit_price:.2f}")
             clean_qty = float(f"{quantity:.4f}")
 
-            # 1. Remove previous pending orders and active stops
+            # 1. Clean previous state
             cancel_pending_limit_entry()
             cancel_all_tracked_stops()
 
@@ -406,7 +425,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
                 "quantity": clean_qty,
                 "reduceOnly": False,
                 "side": side,
-                "symbol": clean_symbol,
+                "symbol": hyphen_symbol,
                 "timestamp": ts,
                 "type": "LIMIT",
                 "userCategory": "EXTERNAL"
@@ -415,7 +434,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             entry_body = json.dumps(entry_params, separators=(",", ":"), sort_keys=True)
             entry_headers = get_headers(entry_body)
 
-            print(f"\n[LIMIT ENTRY] Placing {side} {clean_qty} {clean_symbol} @ Limit Price {clean_price}...")
+            print(f"\n[LIMIT ENTRY] Placing {side} {clean_qty} {hyphen_symbol} @ Limit Price {clean_price}...")
             resp_entry = requests.post(
                 f"{SHARK_BASE_URL}/v1/order/place-order",
                 data=entry_body.encode("utf-8"),
@@ -453,13 +472,22 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
             stop_price = float(f"{sl_price:.2f}")
             ref_price = float(f"{current_price:.2f}") if current_price else 0.0
 
+            # State recovery from live exchange if memory was wiped on server restart
             if CURRENT_POSITION_SIDE is None:
-                _, side = get_active_position_details(clean_symbol)
-                CURRENT_POSITION_SIDE = side
+                size, live_side = get_active_position_details(clean_symbol)
+                if live_side:
+                    CURRENT_POSITION_SIDE = live_side
+                    print(f"[RECOVERY] Restored Position Side from exchange: {CURRENT_POSITION_SIDE}")
 
-            if CURRENT_POSITION_SIDE is None:
+            # Verify that a contract is currently held on exchange before placing stop loss
+            size, live_side = get_active_position_details(clean_symbol)
+            if size == 0 or live_side is None:
                 print(f"[REJECTED UPDATE_SL] No open position found on exchange. Discarding trail.")
+                CURRENT_POSITION_SIDE = None
+                cancel_all_tracked_stops()
                 return
+
+            CURRENT_POSITION_SIDE = live_side
 
             if stop_price > 0:
                 sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
@@ -492,7 +520,7 @@ async def receive_webhook(request: Request):
         raise HTTPException(status_code=403, detail="Invalid secret passphrase")
 
     action = str(data.get("action", "")).upper()
-    symbol = str(data.get("symbol", "BTCUSDT"))
+    symbol = str(data.get("symbol", "BTC-USDT"))
     quantity = float(data.get("quantity", 0.002))
     target_limit_price = float(data.get("price", 0.0))
     sl_price = float(data.get("sl_price", 0.0))
