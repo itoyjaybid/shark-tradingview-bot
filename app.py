@@ -100,7 +100,7 @@ def get_current_market_price(symbol: str) -> float:
 
 def get_active_position_details(symbol: str):
     """
-    Queries Shark Exchange positions using both unparameterized and parameterized endpoints.
+    Queries Shark Exchange positions using multiple lookup formats.
     Returns (position_size, side).
     size: positive float (e.g. 0.002).
     side: 'BUY' (Long) or 'SELL' (Short) or None.
@@ -110,7 +110,6 @@ def get_active_position_details(symbol: str):
         hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
         ts = str(int(time.time() * 1000))
 
-        # Check plain timestamp, hyphenated, and clean symbol queries
         for q in [f"timestamp={ts}", f"symbol={hyphen_target}&timestamp={ts}", f"symbol={clean_target}&timestamp={ts}"]:
             headers = get_headers(q)
             resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q}", headers=headers, timeout=4)
@@ -292,18 +291,21 @@ def cancel_pending_limit_entry():
         ACTIVE_ENTRY_ORDER_ID = None
 
 
-def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0):
+def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0) -> str:
+    """
+    Submits a STOP_LIMIT order and returns the clientOrderId upon success.
+    """
     global ACTIVE_SL_CLIENT_IDS, CURRENT_TRADE_ID
     try:
         clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
 
         if ref_price > 0:
             if side == "SELL" and stop_price >= ref_price:
-                print(f"[GUARD] Long SL {stop_price} >= Price {ref_price}. Skipping.")
-                return
+                print(f"[GUARD] Long SL {stop_price} >= Price {ref_price}. Skipping placement.")
+                return None
             if side == "BUY" and stop_price <= ref_price:
-                print(f"[GUARD] Short SL {stop_price} <= Price {ref_price}. Skipping.")
-                return
+                print(f"[GUARD] Short SL {stop_price} <= Price {ref_price}. Skipping placement.")
+                return None
 
         offset = 15.0
         limit_price = round(stop_price - offset, 2) if side == "SELL" else round(stop_price + offset, 2)
@@ -343,25 +345,26 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
             res_data = resp.json()
             cid = res_data.get("clientOrderId") or res_data.get("data", {}).get("clientOrderId")
             if cid:
-                ACTIVE_SL_CLIENT_IDS.append(cid)
                 print(f">>> [SUCCESS] STOP_LIMIT Placed at {clean_stop_price} | ID: {cid}")
-
                 threading.Thread(
                     target=monitor_slippage_and_market_close,
                     args=(clean_target, side, clean_qty, clean_limit_price, cid, CURRENT_TRADE_ID),
                     daemon=True
                 ).start()
+                return cid
         else:
             print(f">>> [SL ERROR HTTP {resp.status_code}]: {resp.text}")
+            return None
     except Exception as e:
         print(f"[SL EXEC ERROR]: {e}")
+        return None
 
 
 def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: float, trade_id: int, quantity: float):
     """
     Monitors limit order execution with an automatic time-based cancellation cutoff.
     """
-    global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, ACTIVE_ENTRY_ORDER_ID
+    global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, ACTIVE_ENTRY_ORDER_ID, ACTIVE_SL_CLIENT_IDS
     is_buy = target_side == "BUY"
     start_time = time.time()
 
@@ -388,7 +391,9 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
             initial_stop = round(real_fill_price - 100.0, 2) if is_buy else round(real_fill_price + 100.0, 2)
             sl_side = "SELL" if is_buy else "BUY"
 
-            place_stop_loss(clean_symbol, sl_side, quantity, initial_stop, real_fill_price)
+            new_sl_id = place_stop_loss(clean_symbol, sl_side, quantity, initial_stop, real_fill_price)
+            if new_sl_id:
+                ACTIVE_SL_CLIENT_IDS.append(new_sl_id)
             return
 
     print(f"[WATCHER] Limit order timed out after {ENTRY_ORDER_EXPIRATION_SECONDS}s without filling. Canceling order...")
@@ -418,7 +423,6 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
             ts = str(int(time.time() * 1000))
 
-            # Order engine accepts plain symbol format (BTCUSDT)
             entry_params = {
                 "deviceType": "WEB",
                 "marginAsset": "INR",
@@ -462,7 +466,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
 
 def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_price: float, trade_id: int):
-    global CURRENT_POSITION_SIDE, CURRENT_TRADE_ID
+    global CURRENT_POSITION_SIDE, CURRENT_TRADE_ID, ACTIVE_SL_CLIENT_IDS
     with ORDER_EXECUTION_LOCK:
         try:
             clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
@@ -481,23 +485,29 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
                     CURRENT_POSITION_SIDE = live_side
                     print(f"[RECOVERY] Restored Position Side from exchange: {CURRENT_POSITION_SIDE}")
 
-            # Verify that a contract is currently held on exchange before placing stop loss
-            size, live_side = get_active_position_details(clean_symbol)
-            if size == 0 or live_side is None:
-                print(f"[REJECTED UPDATE_SL] No open position found on exchange. Discarding trail.")
-                CURRENT_POSITION_SIDE = None
-                cancel_all_tracked_stops()
+            if CURRENT_POSITION_SIDE is None:
+                print(f"[REJECTED UPDATE_SL] No open position known or found on exchange. Discarding trail.")
                 return
 
-            CURRENT_POSITION_SIDE = live_side
-
-            if stop_price > 0:
-                sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
-                print(f"[UPDATE_SL] Moving {sl_side} Stop to {stop_price}...")
-                cancel_all_tracked_stops()
-                place_stop_loss(clean_symbol, sl_side, clean_qty, stop_price, ref_price)
-            else:
+            if stop_price <= 0:
                 print(f"[UPDATE_SL] Invalid stop price {stop_price}. Skipped.")
+                return
+
+            sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
+
+            # 1. Place the new STOP_LIMIT FIRST
+            print(f"[UPDATE_SL] Submitting new {sl_side} Stop to {stop_price}...")
+            new_sl_id = place_stop_loss(clean_symbol, sl_side, clean_qty, stop_price, ref_price)
+
+            # 2. ONLY cancel previous stop orders if the new stop order was confirmed
+            if new_sl_id:
+                old_stops = [cid for cid in ACTIVE_SL_CLIENT_IDS if cid != new_sl_id]
+                for old_cid in old_stops:
+                    delete_single_order(old_cid)
+                ACTIVE_SL_CLIENT_IDS = [new_sl_id]
+                print(f">>> [TRAILING SL UPDATED] Active stop is now {new_sl_id} at {stop_price}")
+            else:
+                print(f"[WARN] New SL placement failed or was skipped. Keeping existing protective stops intact.")
 
         except Exception as e:
             print(f"[TRAILING SL ERROR]: {e}")
