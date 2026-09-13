@@ -58,7 +58,7 @@ def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
         hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
         ts = str(int(time.time() * 1000))
 
-        for sym_var in [hyphen_target, clean_target]:
+        for sym_var in [clean_target, hyphen_target]:
             query_str = f"symbol={sym_var}&timestamp={ts}"
             headers = get_headers(query_str)
             resp = requests.get(f"{SHARK_BASE_URL}/v1/order/open-orders?{query_str}", headers=headers, timeout=5)
@@ -83,7 +83,7 @@ def get_current_market_price(symbol: str) -> float:
         hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
         ts = str(int(time.time() * 1000))
 
-        for sym_var in [hyphen_target, clean_target]:
+        for sym_var in [clean_target, hyphen_target]:
             query_str = f"symbol={sym_var}&timestamp={ts}"
             headers = get_headers(query_str)
             resp = requests.get(f"{SHARK_BASE_URL}/v1/ticker/price?{query_str}", headers=headers, timeout=3)
@@ -100,7 +100,7 @@ def get_current_market_price(symbol: str) -> float:
 
 def get_active_position_details(symbol: str):
     """
-    Queries Shark Exchange with both hyphenated and plain symbol formats.
+    Queries Shark Exchange positions using both unparameterized and parameterized endpoints.
     Returns (position_size, side).
     size: positive float (e.g. 0.002).
     side: 'BUY' (Long) or 'SELL' (Short) or None.
@@ -110,7 +110,8 @@ def get_active_position_details(symbol: str):
         hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
         ts = str(int(time.time() * 1000))
 
-        for q in [f"symbol={hyphen_target}&timestamp={ts}", f"timestamp={ts}", f"symbol={clean_target}&timestamp={ts}"]:
+        # Check plain timestamp, hyphenated, and clean symbol queries
+        for q in [f"timestamp={ts}", f"symbol={hyphen_target}&timestamp={ts}", f"symbol={clean_target}&timestamp={ts}"]:
             headers = get_headers(q)
             resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q}", headers=headers, timeout=4)
 
@@ -124,7 +125,7 @@ def get_active_position_details(symbol: str):
                             amt = float(pos.get("positionAmt") or pos.get("size") or pos.get("contractVal") or 0.0)
                             if amt != 0:
                                 pos_side = "BUY" if amt > 0 else "SELL"
-                                print(f">>> [POSITION DETECTED] Found active {pos_side} position: {abs(amt)} {raw_sym}")
+                                print(f">>> [POSITION DETECTED] Found active {pos_side} position: {abs(amt)} ({pos.get('symbol')})")
                                 return abs(amt), pos_side
     except Exception as e:
         print(f"[POSITION DETAIL CHECK ERROR]: {e}")
@@ -132,10 +133,9 @@ def get_active_position_details(symbol: str):
 
 
 def emergency_market_close(symbol: str, side: str, quantity: float):
-    """Executes an immediate market order with reduceOnly=True to liquidate an open position."""
+    """Executes an immediate market order with reduceOnly=True using clean symbol."""
     try:
         clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
-        hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
         ts = str(int(time.time() * 1000))
 
         close_params = {
@@ -145,7 +145,7 @@ def emergency_market_close(symbol: str, side: str, quantity: float):
             "quantity": float(f"{quantity:.4f}"),
             "reduceOnly": True,
             "side": side,
-            "symbol": hyphen_target,
+            "symbol": clean_target,
             "timestamp": ts,
             "type": "MARKET",
             "userCategory": "EXTERNAL"
@@ -169,8 +169,9 @@ def close_position_immediately(symbol: str):
     size, side = get_active_position_details(symbol)
     if size > 0 and side:
         close_side = "SELL" if side == "BUY" else "BUY"
+        clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
         print(f"[AUTO-REVERSAL FLATTEN] Closing prior {side} position ({size} BTC) via {close_side} MARKET order...")
-        emergency_market_close(symbol, close_side, size)
+        emergency_market_close(clean_target, close_side, size)
         time.sleep(1.5)
 
 
@@ -178,10 +179,11 @@ def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, l
     """Monitors price while STOP_LIMIT is resting to sweep via market if blown past."""
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE
     is_buying_back = side == "BUY"
+    clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
 
     while sl_client_id in ACTIVE_SL_CLIENT_IDS and CURRENT_TRADE_ID == trade_id:
         time.sleep(1.0)
-        curr_price = get_current_market_price(symbol)
+        curr_price = get_current_market_price(clean_target)
         if curr_price <= 0.0:
             continue
 
@@ -191,11 +193,11 @@ def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, l
         if spike_short_breached or spike_long_breached:
             print(f"\n[SPIKE DETECTED] Price ({curr_price}) breached limit ceiling ({limit_price})!")
             with ORDER_EXECUTION_LOCK:
-                size, _ = get_active_position_details(symbol)
+                size, _ = get_active_position_details(clean_target)
                 if size > 0:
                     print(f"[EMERGENCY ACTIVATED] Liquidating immediately via Market Order...")
                     cancel_all_tracked_stops()
-                    emergency_market_close(symbol, side, quantity)
+                    emergency_market_close(clean_target, side, quantity)
                     CURRENT_POSITION_SIDE = None
                 else:
                     print(f"[MONITOR] Position already filled. Standing down.")
@@ -229,21 +231,22 @@ def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: flo
                                     return entry_p
 
             ts2 = str(int(time.time() * 1000))
-            query_str2 = f"symbol={hyphen_target}&timestamp={ts2}"
-            headers2 = get_headers(query_str2)
-            resp2 = requests.get(f"{SHARK_BASE_URL}/v1/order/trade-history?{query_str2}", headers=headers2, timeout=5)
+            for sym_var in [hyphen_target, clean_target]:
+                query_str2 = f"symbol={sym_var}&timestamp={ts2}"
+                headers2 = get_headers(query_str2)
+                resp2 = requests.get(f"{SHARK_BASE_URL}/v1/order/trade-history?{query_str2}", headers=headers2, timeout=5)
 
-            if resp2.status_code == 200:
-                trades_data = resp2.json()
-                trades = trades_data.get("data", trades_data) if isinstance(trades_data, dict) else trades_data
-                if isinstance(trades, list) and len(trades) > 0:
-                    for trade in trades:
-                        t_cid = str(trade.get("clientOrderId", "") or trade.get("orderId", ""))
-                        if client_order_id in t_cid or t_cid in client_order_id:
-                            trade_price = float(trade.get("price") or trade.get("executedPrice") or 0.0)
-                            if trade_price > 0:
-                                print(f">>> [FOUND REAL ENTRY] Trade history price: {trade_price}")
-                                return trade_price
+                if resp2.status_code == 200:
+                    trades_data = resp2.json()
+                    trades = trades_data.get("data", trades_data) if isinstance(trades_data, dict) else trades_data
+                    if isinstance(trades, list) and len(trades) > 0:
+                        for trade in trades:
+                            t_cid = str(trade.get("clientOrderId", "") or trade.get("orderId", ""))
+                            if client_order_id in t_cid or t_cid in client_order_id:
+                                trade_price = float(trade.get("price") or trade.get("executedPrice") or 0.0)
+                                if trade_price > 0:
+                                    print(f">>> [FOUND REAL ENTRY] Trade history price: {trade_price}")
+                                    return trade_price
 
         except Exception as e:
             print(f"[FETCH ATTEMPT {attempt + 1} ERROR]: {e}")
@@ -293,7 +296,6 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
     global ACTIVE_SL_CLIENT_IDS, CURRENT_TRADE_ID
     try:
         clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
-        hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
 
         if ref_price > 0:
             if side == "SELL" and stop_price >= ref_price:
@@ -320,7 +322,7 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
             "reduceOnly": True,
             "side": side,
             "stopPrice": clean_stop_price,
-            "symbol": hyphen_target,
+            "symbol": clean_target,
             "timestamp": ts,
             "type": "STOP_LIMIT",
             "userCategory": "EXTERNAL"
@@ -400,7 +402,6 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
     with ORDER_EXECUTION_LOCK:
         try:
             clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
-            hyphen_symbol = f"{clean_symbol[:-4]}-{clean_symbol[-4:]}" if clean_symbol.endswith("USDT") else clean_symbol
             clean_price = float(f"{target_limit_price:.2f}")
             clean_qty = float(f"{quantity:.4f}")
 
@@ -417,6 +418,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
             ts = str(int(time.time() * 1000))
 
+            # Order engine accepts plain symbol format (BTCUSDT)
             entry_params = {
                 "deviceType": "WEB",
                 "marginAsset": "INR",
@@ -425,7 +427,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
                 "quantity": clean_qty,
                 "reduceOnly": False,
                 "side": side,
-                "symbol": hyphen_symbol,
+                "symbol": clean_symbol,
                 "timestamp": ts,
                 "type": "LIMIT",
                 "userCategory": "EXTERNAL"
@@ -434,7 +436,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             entry_body = json.dumps(entry_params, separators=(",", ":"), sort_keys=True)
             entry_headers = get_headers(entry_body)
 
-            print(f"\n[LIMIT ENTRY] Placing {side} {clean_qty} {hyphen_symbol} @ Limit Price {clean_price}...")
+            print(f"\n[LIMIT ENTRY] Placing {side} {clean_qty} {clean_symbol} @ Limit Price {clean_price}...")
             resp_entry = requests.post(
                 f"{SHARK_BASE_URL}/v1/order/place-order",
                 data=entry_body.encode("utf-8"),
@@ -520,7 +522,7 @@ async def receive_webhook(request: Request):
         raise HTTPException(status_code=403, detail="Invalid secret passphrase")
 
     action = str(data.get("action", "")).upper()
-    symbol = str(data.get("symbol", "BTC-USDT"))
+    symbol = str(data.get("symbol", "BTCUSDT"))
     quantity = float(data.get("quantity", 0.002))
     target_limit_price = float(data.get("price", 0.0))
     sl_price = float(data.get("sl_price", 0.0))
