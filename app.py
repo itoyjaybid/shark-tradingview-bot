@@ -294,17 +294,26 @@ def cancel_pending_limit_entry():
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0) -> str:
     """
     Submits a STOP_LIMIT order and returns the clientOrderId upon success.
+    Safely validates stop price against live ticker if payload ref_price is identical or invalid.
     """
     global ACTIVE_SL_CLIENT_IDS, CURRENT_TRADE_ID
     try:
         clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
 
+        # If payload price is invalid or creates a false conflict (e.g. ref_price == stop_price),
+        # pull live market price from the exchange ticker.
+        if ref_price <= 0 or (side == "SELL" and stop_price >= ref_price) or (side == "BUY" and stop_price <= ref_price):
+            live_mkt = get_current_market_price(clean_target)
+            if live_mkt > 0:
+                print(f"[GUARD CHECK] Verified ref_price using live market ticker: {live_mkt}")
+                ref_price = live_mkt
+
         if ref_price > 0:
             if side == "SELL" and stop_price >= ref_price:
-                print(f"[GUARD] Long SL {stop_price} >= Price {ref_price}. Skipping placement.")
+                print(f"[GUARD] Long SL {stop_price} >= Market Price {ref_price}. Skipping placement.")
                 return None
             if side == "BUY" and stop_price <= ref_price:
-                print(f"[GUARD] Short SL {stop_price} <= Price {ref_price}. Skipping placement.")
+                print(f"[GUARD] Short SL {stop_price} <= Market Price {ref_price}. Skipping placement.")
                 return None
 
         offset = 15.0
@@ -478,12 +487,12 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
             stop_price = float(f"{sl_price:.2f}")
             ref_price = float(f"{current_price:.2f}") if current_price else 0.0
 
-            # 1. First recovery source: Alert fallback_side from TradingView
+            # 1. Recover from alert payload fallback_side if server restarted
             if CURRENT_POSITION_SIDE is None and fallback_side in ["BUY", "SELL"]:
                 CURRENT_POSITION_SIDE = fallback_side
                 print(f"[RECOVERY] Restored Position Side from alert: {CURRENT_POSITION_SIDE}")
 
-            # 2. Second recovery source: Live exchange check
+            # 2. Recover from live exchange endpoint
             if CURRENT_POSITION_SIDE is None:
                 size, live_side = get_active_position_details(clean_symbol)
                 if live_side:
@@ -500,11 +509,11 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
 
             sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
 
-            # 3. Place the new STOP_LIMIT FIRST
+            # 3. Place the new STOP_LIMIT FIRST (Atomic switch)
             print(f"[UPDATE_SL] Submitting new {sl_side} Stop to {stop_price}...")
             new_sl_id = place_stop_loss(clean_symbol, sl_side, clean_qty, stop_price, ref_price)
 
-            # 4. ONLY cancel previous stop orders if the new stop order was confirmed
+            # 4. ONLY delete old stop orders if the new stop order was confirmed
             if new_sl_id:
                 old_stops = [cid for cid in ACTIVE_SL_CLIENT_IDS if cid != new_sl_id]
                 for old_cid in old_stops:
@@ -543,7 +552,6 @@ async def receive_webhook(request: Request):
     sl_price = float(data.get("sl_price", 0.0))
     trade_id = int(data.get("trade_id", 0))
 
-    # Read fallback side if provided by alert
     fallback_side = data.get("position_side") or data.get("side")
     if fallback_side:
         fallback_side = str(fallback_side).upper()
