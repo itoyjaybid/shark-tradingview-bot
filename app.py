@@ -465,20 +465,25 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             print(f"[LIMIT ENTRY EXEC ERROR]: {e}")
 
 
-def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_price: float, trade_id: int):
+def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_price: float, trade_id: int, fallback_side: str = None):
     global CURRENT_POSITION_SIDE, CURRENT_TRADE_ID, ACTIVE_SL_CLIENT_IDS
     with ORDER_EXECUTION_LOCK:
         try:
             clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
 
-            print(f"[UPDATE_SL] Requested SL: {sl_price} | Position Side: {CURRENT_POSITION_SIDE} | TradeID: {trade_id}")
+            print(f"[UPDATE_SL] Requested SL: {sl_price} | Position Side: {CURRENT_POSITION_SIDE} | Fallback Side: {fallback_side} | TradeID: {trade_id}")
 
             CURRENT_TRADE_ID = trade_id
             clean_qty = float(f"{quantity:.4f}")
             stop_price = float(f"{sl_price:.2f}")
             ref_price = float(f"{current_price:.2f}") if current_price else 0.0
 
-            # State recovery from live exchange if memory was wiped on server restart
+            # 1. First recovery source: Alert fallback_side from TradingView
+            if CURRENT_POSITION_SIDE is None and fallback_side in ["BUY", "SELL"]:
+                CURRENT_POSITION_SIDE = fallback_side
+                print(f"[RECOVERY] Restored Position Side from alert: {CURRENT_POSITION_SIDE}")
+
+            # 2. Second recovery source: Live exchange check
             if CURRENT_POSITION_SIDE is None:
                 size, live_side = get_active_position_details(clean_symbol)
                 if live_side:
@@ -495,11 +500,11 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
 
             sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
 
-            # 1. Place the new STOP_LIMIT FIRST
+            # 3. Place the new STOP_LIMIT FIRST
             print(f"[UPDATE_SL] Submitting new {sl_side} Stop to {stop_price}...")
             new_sl_id = place_stop_loss(clean_symbol, sl_side, clean_qty, stop_price, ref_price)
 
-            # 2. ONLY cancel previous stop orders if the new stop order was confirmed
+            # 4. ONLY cancel previous stop orders if the new stop order was confirmed
             if new_sl_id:
                 old_stops = [cid for cid in ACTIVE_SL_CLIENT_IDS if cid != new_sl_id]
                 for old_cid in old_stops:
@@ -538,6 +543,11 @@ async def receive_webhook(request: Request):
     sl_price = float(data.get("sl_price", 0.0))
     trade_id = int(data.get("trade_id", 0))
 
+    # Read fallback side if provided by alert
+    fallback_side = data.get("position_side") or data.get("side")
+    if fallback_side:
+        fallback_side = str(fallback_side).upper()
+
     if action == "UPDATE_SL" and sl_price == 0.0 and target_limit_price > 0.0:
         sl_price = target_limit_price
 
@@ -553,7 +563,7 @@ async def receive_webhook(request: Request):
     elif action == "UPDATE_SL":
         threading.Thread(
             target=update_trailing_stop,
-            args=(symbol, quantity, sl_price, target_limit_price, trade_id),
+            args=(symbol, quantity, sl_price, target_limit_price, trade_id, fallback_side),
             daemon=True
         ).start()
 
