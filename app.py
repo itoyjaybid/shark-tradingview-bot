@@ -25,7 +25,7 @@ SHARK_API_KEY = os.getenv("SHARK_API_KEY", "").strip().strip("'").strip('"')
 SHARK_API_SECRET = os.getenv("SHARK_API_SECRET", "").strip().strip("'").strip('"')
 WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MY_SECRET_KEY").strip().strip("'").strip('"')
 
-# Condition 6 & 10: Configurable timeout duration for limit entries
+# Condition 6 & 10: Limit entry timeout duration (seconds)
 ENTRY_ORDER_EXPIRATION_SECONDS = 600
 
 CURRENT_TRADE_ID = None
@@ -200,7 +200,7 @@ def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, l
                     emergency_market_close(clean_target, side, quantity)
                     CURRENT_POSITION_SIDE = None
                 else:
-                    print(f"[MONITOR] Position already filled. Standing down.")
+                    print(f"[MONITOR] Position already closed or filled. Standing down.")
             break
 
 
@@ -277,7 +277,7 @@ def delete_single_order(client_order_id: str, symbol: str = "BTC-USDT") -> bool:
 
     for sym_candidate in variants:
         try:
-            # Method 1: Query string DELETE
+            # 1. Query string DELETE
             query_str = f"clientOrderId={client_order_id}&symbol={sym_candidate}&timestamp={ts}"
             headers_q = get_headers(query_str)
             resp_q = requests.delete(
@@ -289,7 +289,7 @@ def delete_single_order(client_order_id: str, symbol: str = "BTC-USDT") -> bool:
             if resp_q.status_code in [200, 201, 204]:
                 success = True
 
-            # Method 2: JSON Body DELETE
+            # 2. JSON Body DELETE
             payload = {"clientOrderId": str(client_order_id), "symbol": sym_candidate, "timestamp": ts}
             body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
             headers_b = get_headers(body)
@@ -505,34 +505,31 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
 
 def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_price: float, trade_id: int, fallback_side: str = None):
-    """Replaces older stop orders with newly confirmed swing/profit lock levels (Conditions 4, 5, 11, 12)."""
+    """
+    Guarantees that no SL order is placed unless there is a real,
+    active open position confirmed on Shark Exchange.
+    """
     global CURRENT_POSITION_SIDE, CURRENT_TRADE_ID, ACTIVE_SL_CLIENT_IDS
     with ORDER_EXECUTION_LOCK:
         try:
             clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
 
-            print(f"[UPDATE_SL] Requested SL: {sl_price} | Position Side: {CURRENT_POSITION_SIDE} | Fallback Side: {fallback_side} | TradeID: {trade_id}")
+            # 1. ALWAYS query Shark Exchange first to verify open contracts
+            pos_size, live_side = get_active_position_details(clean_symbol)
 
+            # Strict guard: If there is no real position open on the exchange, discard immediately
+            if pos_size <= 0 or live_side is None:
+                print(f"[REJECTED UPDATE_SL] No open trade found on Shark Exchange (Size: {pos_size}). Discarding trailing SL.")
+                CURRENT_POSITION_SIDE = None
+                return
+
+            # 2. Position confirmed on exchange; assign verified side and trade ID
+            CURRENT_POSITION_SIDE = live_side
             CURRENT_TRADE_ID = trade_id
+
             clean_qty = float(f"{quantity:.4f}")
             stop_price = float(f"{sl_price:.2f}")
             ref_price = float(f"{current_price:.2f}") if current_price else 0.0
-
-            # 1. Recover position side from webhook payload (Condition 11)
-            if CURRENT_POSITION_SIDE is None and fallback_side in ["BUY", "SELL"]:
-                CURRENT_POSITION_SIDE = fallback_side
-                print(f"[RECOVERY] Restored Position Side from alert: {CURRENT_POSITION_SIDE}")
-
-            # 2. Recover from live exchange endpoint
-            if CURRENT_POSITION_SIDE is None:
-                size, live_side = get_active_position_details(clean_symbol)
-                if live_side:
-                    CURRENT_POSITION_SIDE = live_side
-                    print(f"[RECOVERY] Restored Position Side from exchange: {CURRENT_POSITION_SIDE}")
-
-            if CURRENT_POSITION_SIDE is None:
-                print(f"[REJECTED UPDATE_SL] No open position known or found on exchange. Discarding trail.")
-                return
 
             if stop_price <= 0:
                 print(f"[UPDATE_SL] Invalid stop price {stop_price}. Skipped.")
@@ -540,11 +537,11 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
 
             sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
 
-            # 3. Place new STOP_LIMIT first
-            print(f"[UPDATE_SL] Submitting new {sl_side} Stop to {stop_price}...")
+            # 3. Submit updated STOP_LIMIT order
+            print(f"[UPDATE_SL] Confirmed open position {CURRENT_POSITION_SIDE} ({pos_size} BTC). Placing {sl_side} Stop @ {stop_price}...")
             new_sl_id = place_stop_loss(clean_symbol, sl_side, clean_qty, stop_price, ref_price)
 
-            # 4. Cancel old stops only if the new one was accepted
+            # 4. Remove previous stop orders only after new order is accepted
             if new_sl_id:
                 old_stops = [cid for cid in ACTIVE_SL_CLIENT_IDS if cid != new_sl_id]
                 for old_cid in old_stops:
@@ -552,7 +549,7 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
                 ACTIVE_SL_CLIENT_IDS = [new_sl_id]
                 print(f">>> [TRAILING SL UPDATED] Active stop is now {new_sl_id} at {stop_price}")
             else:
-                print(f"[WARN] New SL placement failed or was skipped. Keeping existing protective stops intact.")
+                print(f"[WARN] New SL placement failed or skipped. Keeping existing stops intact.")
 
         except Exception as e:
             print(f"[TRAILING SL ERROR]: {e}")
@@ -578,13 +575,12 @@ async def receive_webhook(request: Request):
 
     action = str(data.get("action", "")).upper()
     symbol = str(data.get("symbol", "BTCUSDT"))
-    # Condition 8: Read dynamic trade quantity from payload
+    # Condition 8: Dynamically uses quantity from TradingView alert payload
     quantity = float(data.get("quantity", 0.002))
     target_limit_price = float(data.get("price", 0.0))
     sl_price = float(data.get("sl_price", 0.0))
     trade_id = int(data.get("trade_id", 0))
 
-    # Condition 11: Read position_side from payload to prevent state desync
     fallback_side = data.get("position_side") or data.get("side")
     if fallback_side:
         fallback_side = str(fallback_side).upper()
