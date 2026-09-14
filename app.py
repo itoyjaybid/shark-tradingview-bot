@@ -36,7 +36,7 @@ ORDER_EXECUTION_LOCK = threading.Lock()
 
 
 def get_headers(payload_or_querystr: str) -> dict:
-    """Generates precise HMAC-SHA256 signature for Shark Exchange authentication."""
+    """Generates HMAC-SHA256 signature for Shark Exchange authentication."""
     sig = hmac.new(
         SHARK_API_SECRET.encode("utf-8"),
         payload_or_querystr.encode("utf-8"),
@@ -64,7 +64,7 @@ def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
         for sym in get_symbol_variants(symbol):
             query_str = f"symbol={sym}&timestamp={ts}"
             headers = get_headers(query_str)
-            resp = requests.get(f"{SHARK_BASE_URL}/v1/order/open-orders?{query_str}", headers=headers, timeout=3)
+            resp = requests.get(f"{SHARK_BASE_URL}/v1/order/open-orders?{query_str}", headers=headers, timeout=2)
             if resp.status_code == 200:
                 res = resp.json()
                 orders = res.get("data", []) if isinstance(res, dict) else res
@@ -76,7 +76,7 @@ def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
         return False
     except Exception as e:
         print(f"[STATUS CHECK ERROR]: {e}")
-        return True  # Fail-safe: assume still open during transient network drops
+        return True  # Fail-safe: assume still open during transient network drops to prevent false fills
 
 
 def get_current_market_price(symbol: str) -> float:
@@ -131,7 +131,7 @@ def get_active_position_details(symbol: str):
 
         for q in queries:
             headers = get_headers(q)
-            resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q}", headers=headers, timeout=3)
+            resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q}", headers=headers, timeout=2)
 
             if resp.status_code == 200:
                 raw_json = resp.json()
@@ -180,7 +180,7 @@ def delete_single_order(client_order_id: str) -> bool:
                 f"{SHARK_BASE_URL}/v1/order/delete-order",
                 data=body.encode("utf-8"),
                 headers=headers,
-                timeout=4
+                timeout=3
             )
             print(f"[CLEANUP] Cancel order ({client_order_id}) -> HTTP {resp.status_code} | {resp.text.strip()}")
             if resp.status_code in [200, 201, 204]:
@@ -233,7 +233,7 @@ def emergency_market_close(symbol: str, side: str, quantity: float):
             f"{SHARK_BASE_URL}/v1/order/place-order",
             data=body.encode("utf-8"),
             headers=headers,
-            timeout=4
+            timeout=3
         )
         print(f">>> [MARKET FLATTEN RESULT HTTP {resp.status_code}]: {resp.text.strip()}")
     except Exception as e:
@@ -248,7 +248,7 @@ def close_position_immediately(symbol: str):
         clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
         print(f"[AUTO-REVERSAL] Liquidating prior {side} ({size} BTC) via {close_side} MARKET order...")
         emergency_market_close(clean_target, close_side, size)
-        time.sleep(1.0)
+        time.sleep(0.5)
 
 
 def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, limit_price: float, sl_client_id: str, trade_id: int):
@@ -330,7 +330,7 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
             f"{SHARK_BASE_URL}/v1/order/place-order",
             data=sl_body.encode("utf-8"),
             headers=sl_headers,
-            timeout=4
+            timeout=3
         )
 
         if resp.status_code in [200, 201]:
@@ -357,8 +357,8 @@ def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: flo
     clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
     variants = get_symbol_variants(symbol)
 
-    for attempt in range(2):
-        time.sleep(0.3)
+    for _ in range(2):
+        time.sleep(0.25)
         try:
             ts = str(int(time.time() * 1000))
             for sym in variants + [""]:
@@ -379,7 +379,7 @@ def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: flo
         except Exception as e:
             print(f"[FAST FILL ERROR]: {e}")
 
-    # For Limit orders, the executed fill is confirmed at the posted limit price
+    # For Limit orders, execution is guaranteed at or better than the target limit price
     print(f">>> [SYNCED FILL] Entry confirmed at order limit price: {fallback_price}")
     return fallback_price
 
@@ -473,7 +473,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
                 f"{SHARK_BASE_URL}/v1/order/place-order",
                 data=entry_body.encode("utf-8"),
                 headers=entry_headers,
-                timeout=4
+                timeout=3
             )
 
             if resp_entry.status_code in [200, 201]:
@@ -495,41 +495,41 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
 def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_price: float, trade_id: int, fallback_side: str = None):
     """
-    Conditions 4, 5, 11, 12, 13:
-    Replaces trailing stops using verified exchange state and runtime memory fallback.
+    Evaluates position status instantly (no lock block) and updates the trailing stop cleanly.
     """
     global CURRENT_POSITION_SIDE, CURRENT_TRADE_ID, ACTIVE_SL_CLIENT_IDS
-    with ORDER_EXECUTION_LOCK:
-        try:
-            clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
+    try:
+        clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
 
-            # 1. Query Shark Exchange positions
-            pos_size, live_side, _ = get_active_position_details(clean_symbol)
+        # Immediate check outside of lock to avoid stalling when flat
+        pos_size, live_side, _ = get_active_position_details(clean_symbol)
 
-            resolved_side = None
-            if pos_size > 0 and live_side is not None:
-                resolved_side = live_side
-                CURRENT_POSITION_SIDE = live_side
-            elif CURRENT_POSITION_SIDE is not None:
-                resolved_side = CURRENT_POSITION_SIDE
-            elif fallback_side in ["BUY", "SELL"] and CURRENT_TRADE_ID == trade_id:
-                resolved_side = fallback_side
-                CURRENT_POSITION_SIDE = fallback_side
+        resolved_side = None
+        if pos_size > 0 and live_side is not None:
+            resolved_side = live_side
+            CURRENT_POSITION_SIDE = live_side
+        elif CURRENT_POSITION_SIDE is not None:
+            resolved_side = CURRENT_POSITION_SIDE
+        elif fallback_side in ["BUY", "SELL"] and CURRENT_TRADE_ID == trade_id:
+            resolved_side = fallback_side
+            CURRENT_POSITION_SIDE = fallback_side
 
-            # Guard: If no trade exists anywhere, discard (Condition 11)
-            if resolved_side is None:
-                print(f"[REJECTED UPDATE_SL] No open trade found on exchange or in bot state. Discarding trailing SL.")
-                return
+        # Immediate rejection if no position exists anywhere
+        if resolved_side is None:
+            print(f"[REJECTED UPDATE_SL] No open trade found on exchange or in bot state. Discarding trailing SL.")
+            return
 
+        stop_price = float(f"{sl_price:.2f}")
+        ref_price = float(f"{current_price:.2f}") if current_price else 0.0
+
+        if stop_price <= 0:
+            print(f"[UPDATE_SL] Invalid stop price {stop_price}. Skipped.")
+            return
+
+        # Acquire lock only during order modification
+        with ORDER_EXECUTION_LOCK:
             CURRENT_TRADE_ID = trade_id
             clean_qty = float(f"{quantity:.4f}")
-            stop_price = float(f"{sl_price:.2f}")
-            ref_price = float(f"{current_price:.2f}") if current_price else 0.0
-
-            if stop_price <= 0:
-                print(f"[UPDATE_SL] Invalid stop price {stop_price}. Skipped.")
-                return
-
             sl_side = "SELL" if resolved_side == "BUY" else "BUY"
 
             print(f"[UPDATE_SL] Confirmed position side {resolved_side}. Placing {sl_side} Stop @ {stop_price}...")
@@ -544,8 +544,8 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
             else:
                 print(f"[WARN] New SL placement failed or skipped. Keeping existing stops intact.")
 
-        except Exception as e:
-            print(f"[TRAILING SL ERROR]: {e}")
+    except Exception as e:
+        print(f"[TRAILING SL ERROR]: {e}")
 
 
 # =============================================================================
