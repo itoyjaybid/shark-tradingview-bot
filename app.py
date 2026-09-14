@@ -50,14 +50,18 @@ def get_headers(payload_or_querystr: str) -> dict:
     }
 
 
+def get_symbol_variants(symbol: str) -> list[str]:
+    """Generates both hyphenated and non-hyphenated formats (e.g., BTC-USDT and BTCUSDT)."""
+    clean_no_hyphen = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
+    hyphen_variant = f"{clean_no_hyphen[:-4]}-{clean_no_hyphen[-4:]}" if clean_no_hyphen.endswith("USDT") else clean_no_hyphen
+    return [hyphen_variant, clean_no_hyphen]
+
+
 def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
     """Checks whether an entry order is still resting on the order book."""
     try:
-        clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
-        hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
         ts = str(int(time.time() * 1000))
-
-        for sym_var in [clean_target, hyphen_target]:
+        for sym_var in get_symbol_variants(symbol):
             query_str = f"symbol={sym_var}&timestamp={ts}"
             headers = get_headers(query_str)
             resp = requests.get(f"{SHARK_BASE_URL}/v1/order/open-orders?{query_str}", headers=headers, timeout=5)
@@ -78,11 +82,8 @@ def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
 def get_current_market_price(symbol: str) -> float:
     """Fetches the latest live market price."""
     try:
-        clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
-        hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
         ts = str(int(time.time() * 1000))
-
-        for sym_var in [clean_target, hyphen_target]:
+        for sym_var in get_symbol_variants(symbol):
             query_str = f"symbol={sym_var}&timestamp={ts}"
             headers = get_headers(query_str)
             resp = requests.get(f"{SHARK_BASE_URL}/v1/ticker/price?{query_str}", headers=headers, timeout=3)
@@ -104,10 +105,12 @@ def get_active_position_details(symbol: str):
     """
     try:
         clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
-        hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
         ts = str(int(time.time() * 1000))
 
-        for q in [f"timestamp={ts}", f"symbol={hyphen_target}&timestamp={ts}", f"symbol={clean_target}&timestamp={ts}"]:
+        variants = get_symbol_variants(symbol)
+        queries = [f"timestamp={ts}"] + [f"symbol={v}&timestamp={ts}" for v in variants]
+
+        for q in queries:
             headers = get_headers(q)
             resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q}", headers=headers, timeout=4)
 
@@ -161,7 +164,7 @@ def emergency_market_close(symbol: str, side: str, quantity: float):
 
 
 def close_position_immediately(symbol: str):
-    """Checks exchange-level state and liquidates any existing position to prepare for reversal."""
+    """Liquidates any existing open position immediately via Market order."""
     size, side = get_active_position_details(symbol)
     if size > 0 and side:
         close_side = "SELL" if side == "BUY" else "BUY"
@@ -201,12 +204,9 @@ def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, l
 
 
 def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: float) -> float:
-    """
-    Directly queries order details, positions, and trade history
-    to capture the real executed fill price from Shark Exchange.
-    """
+    """Queries order details, positions, and trade history to capture the real filled entry price."""
     clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
-    hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
+    variants = get_symbol_variants(symbol)
 
     for attempt in range(5):
         time.sleep(1.0)
@@ -214,7 +214,7 @@ def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: flo
             ts = str(int(time.time() * 1000))
 
             # 1. Primary Check: Query order detail by clientOrderId
-            for sym_var in [clean_target, hyphen_target]:
+            for sym_var in variants:
                 q_detail = f"clientOrderId={client_order_id}&symbol={sym_var}&timestamp={ts}"
                 headers_detail = get_headers(q_detail)
                 resp_detail = requests.get(f"{SHARK_BASE_URL}/v1/order/order-detail?{q_detail}", headers=headers_detail, timeout=4)
@@ -228,8 +228,8 @@ def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: flo
                             return exec_price
 
             # 2. Secondary Check: Live positions average price
-            for sym_variant in [clean_target, hyphen_target, ""]:
-                q_pos = f"symbol={sym_variant}&timestamp={ts}" if sym_variant else f"timestamp={ts}"
+            for sym_var in variants + [""]:
+                q_pos = f"symbol={sym_var}&timestamp={ts}" if sym_var else f"timestamp={ts}"
                 headers_pos = get_headers(q_pos)
                 resp_pos = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q_pos}", headers=headers_pos, timeout=4)
                 if resp_pos.status_code == 200:
@@ -245,7 +245,7 @@ def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: flo
                                     return entry_p
 
             # 3. Tertiary Check: Trade history
-            for sym_var in [clean_target, hyphen_target]:
+            for sym_var in variants:
                 query_str2 = f"symbol={sym_var}&timestamp={ts}"
                 headers2 = get_headers(query_str2)
                 resp2 = requests.get(f"{SHARK_BASE_URL}/v1/order/trade-history?{query_str2}", headers=headers2, timeout=4)
@@ -268,51 +268,50 @@ def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: flo
     return fallback_price
 
 
-def delete_single_order(client_order_id: str, symbol: str = "BTCUSDT") -> bool:
+def delete_single_order(client_order_id: str, symbol: str = "BTC-USDT") -> bool:
     """
-    Cancels an order on Shark Exchange using both query string and JSON body fallbacks,
-    ensuring symbol is passed so the order is purged from the book.
+    Exhaustively purges the order by targeting both BTC-USDT and BTCUSDT symbols
+    via both query parameters and JSON body payloads to guarantee cancellation on the matching engine.
     """
-    try:
-        clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
-        ts = str(int(time.time() * 1000))
+    success = False
+    variants = get_symbol_variants(symbol)
+    ts = str(int(time.time() * 1000))
 
-        # Method 1: Cancel via Query Parameters
-        query_str = f"clientOrderId={client_order_id}&symbol={clean_target}&timestamp={ts}"
-        headers_q = get_headers(query_str)
-        resp = requests.delete(
-            f"{SHARK_BASE_URL}/v1/order/delete-order?{query_str}",
-            headers=headers_q,
-            timeout=5
-        )
-        print(f"[CLEANUP QUERY] Cancel ({client_order_id}) -> HTTP {resp.status_code} | {resp.text.strip()}")
+    for sym_candidate in variants:
+        try:
+            # 1. Query String DELETE
+            query_str = f"clientOrderId={client_order_id}&symbol={sym_candidate}&timestamp={ts}"
+            headers_q = get_headers(query_str)
+            resp_q = requests.delete(
+                f"{SHARK_BASE_URL}/v1/order/delete-order?{query_str}",
+                headers=headers_q,
+                timeout=5
+            )
+            print(f"[CLEANUP QUERY {sym_candidate}] Cancel ({client_order_id}) -> HTTP {resp_q.status_code} | {resp_q.text.strip()}")
+            if resp_q.status_code in [200, 201, 204]:
+                success = True
 
-        if resp.status_code in [200, 201, 204]:
-            return True
+            # 2. JSON Body DELETE
+            payload = {"clientOrderId": str(client_order_id), "symbol": sym_candidate, "timestamp": ts}
+            body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            headers_b = get_headers(body)
+            resp_b = requests.delete(
+                f"{SHARK_BASE_URL}/v1/order/delete-order",
+                data=body.encode("utf-8"),
+                headers=headers_b,
+                timeout=5
+            )
+            print(f"[CLEANUP BODY {sym_candidate}] Cancel ({client_order_id}) -> HTTP {resp_b.status_code} | {resp_b.text.strip()}")
+            if resp_b.status_code in [200, 201, 204]:
+                success = True
 
-        # Method 2: Fallback via JSON Body
-        payload = {
-            "clientOrderId": str(client_order_id),
-            "symbol": clean_target,
-            "timestamp": ts
-        }
-        body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-        headers_b = get_headers(body)
-        resp_b = requests.delete(
-            f"{SHARK_BASE_URL}/v1/order/delete-order",
-            data=body.encode("utf-8"),
-            headers=headers_b,
-            timeout=5
-        )
-        print(f"[CLEANUP BODY] Cancel ({client_order_id}) -> HTTP {resp_b.status_code} | {resp_b.text.strip()}")
-        return resp_b.status_code in [200, 201, 204]
+        except Exception as e:
+            print(f"[CLEANUP ATTEMPT ERROR {sym_candidate}]: {e}")
 
-    except Exception as e:
-        print(f"[CLEANUP ERROR]: {e}")
-        return False
+    return success
 
 
-def cancel_all_tracked_stops(symbol: str = "BTCUSDT"):
+def cancel_all_tracked_stops(symbol: str = "BTC-USDT"):
     global ACTIVE_SL_CLIENT_IDS
     if not ACTIVE_SL_CLIENT_IDS:
         return
@@ -321,7 +320,7 @@ def cancel_all_tracked_stops(symbol: str = "BTCUSDT"):
     ACTIVE_SL_CLIENT_IDS = []
 
 
-def cancel_pending_limit_entry(symbol: str = "BTCUSDT"):
+def cancel_pending_limit_entry(symbol: str = "BTC-USDT"):
     global ACTIVE_ENTRY_ORDER_ID
     if ACTIVE_ENTRY_ORDER_ID:
         print(f"[ENTRY CLEANUP] Canceling pending limit entry: {ACTIVE_ENTRY_ORDER_ID}")
@@ -330,10 +329,7 @@ def cancel_pending_limit_entry(symbol: str = "BTCUSDT"):
 
 
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0) -> str:
-    """
-    Submits a STOP_LIMIT order and returns the clientOrderId upon success.
-    Validates against live market ticker if ref_price creates an identical/invalid boundary.
-    """
+    """Submits a STOP_LIMIT order and returns the clientOrderId upon success."""
     global ACTIVE_SL_CLIENT_IDS, CURRENT_TRADE_ID
     try:
         clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
@@ -406,9 +402,7 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
 
 def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: float, trade_id: int, quantity: float):
-    """
-    Monitors limit order execution with an automatic time-based cancellation cutoff.
-    """
+    """Monitors limit order execution with an automatic time-based cutoff."""
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, ACTIVE_ENTRY_ORDER_ID, ACTIVE_SL_CLIENT_IDS
     is_buy = target_side == "BUY"
     start_time = time.time()
@@ -455,11 +449,11 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             clean_price = float(f"{target_limit_price:.2f}")
             clean_qty = float(f"{quantity:.4f}")
 
-            # 1. Cancel previous resting entry & stop orders
+            # 1. Purge all prior resting entry & stop orders across both symbol formats
             cancel_pending_limit_entry(clean_symbol)
             cancel_all_tracked_stops(clean_symbol)
 
-            # 2. Auto-Reversal check: close existing opposite trade at market
+            # 2. Auto-Reversal check: flatten prior open position immediately at market
             close_position_immediately(clean_symbol)
 
             is_buy_intent = "BUY" in action.upper()
