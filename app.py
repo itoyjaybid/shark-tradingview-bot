@@ -162,6 +162,50 @@ def get_active_position_details(symbol: str):
     return 0.0, None, 0.0
 
 
+def check_order_strictly_filled(client_order_id: str, symbol: str) -> tuple[bool, float]:
+    """
+    Condition 14: Accurately checks whether the limit entry was executed on the exchange.
+    Returns (is_filled, executed_avg_price).
+    """
+    ts = str(int(time.time() * 1000))
+    variants = get_symbol_variants(symbol)
+
+    for sym in variants:
+        try:
+            # 1. Order details check
+            q_detail = f"clientOrderId={client_order_id}&symbol={sym}&timestamp={ts}"
+            headers_detail = get_headers(q_detail)
+            resp_detail = requests.get(f"{SHARK_BASE_URL}/v1/order/order-detail?{q_detail}", headers=headers_detail, timeout=2)
+            if resp_detail.status_code == 200:
+                data = resp_detail.json()
+                item = data.get("data", data) if isinstance(data, dict) else data
+                if isinstance(item, dict):
+                    status = str(item.get("status", "")).upper()
+                    if status in ["FILLED", "SUCCESS", "EXECUTED"]:
+                        exec_price = float(item.get("avgPrice") or item.get("price") or item.get("executedPrice") or 0.0)
+                        return True, exec_price
+
+            # 2. Order history check
+            q_hist = f"clientOrderId={client_order_id}&symbol={sym}&timestamp={ts}"
+            headers_hist = get_headers(q_hist)
+            resp_hist = requests.get(f"{SHARK_BASE_URL}/v1/order/order-history?{q_hist}", headers=headers_hist, timeout=2)
+            if resp_hist.status_code == 200:
+                hist_data = resp_hist.json()
+                orders = hist_data.get("data", hist_data) if isinstance(hist_data, dict) else hist_data
+                if isinstance(orders, list):
+                    for o in orders:
+                        cid = str(o.get("clientOrderId", "") or o.get("orderId", ""))
+                        if client_order_id in cid or cid in client_order_id:
+                            status = str(o.get("status", "")).upper()
+                            if status in ["FILLED", "SUCCESS", "EXECUTED"]:
+                                avg_p = float(o.get("avgPrice") or o.get("price") or 0.0)
+                                return True, avg_p
+        except Exception:
+            pass
+
+    return False, 0.0
+
+
 def delete_single_order(client_order_id: str) -> bool:
     """
     Conditions 6 & 7: Cancels order via exact schema matching Shark Exchange's specification.
@@ -353,84 +397,24 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
         return None
 
 
-def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: float) -> float:
-    """
-    Condition 14: Accurately retrieves real fill price (avgPrice) from Shark Exchange 
-    across 6 polling checks (3.0 seconds total) before falling back.
-    """
-    clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
-    variants = get_symbol_variants(symbol)
-
-    for attempt in range(6):
-        time.sleep(0.5)
-        try:
-            ts = str(int(time.time() * 1000))
-
-            # 1. Check order details by clientOrderId
-            for sym in variants:
-                q_detail = f"clientOrderId={client_order_id}&symbol={sym}&timestamp={ts}"
-                headers_detail = get_headers(q_detail)
-                resp_detail = requests.get(f"{SHARK_BASE_URL}/v1/order/order-detail?{q_detail}", headers=headers_detail, timeout=2)
-                if resp_detail.status_code == 200:
-                    data = resp_detail.json()
-                    item = data.get("data", data) if isinstance(data, dict) else data
-                    if isinstance(item, dict):
-                        exec_price = float(item.get("avgPrice") or item.get("price") or item.get("executedPrice") or 0.0)
-                        if exec_price > 0:
-                            print(f">>> [EXACT FILL DETECTED VIA ORDER-DETAIL] Executed Price: {exec_price}")
-                            return exec_price
-
-            # 2. Check live position avg entry price
-            for sym in variants + [""]:
-                q_pos = f"symbol={sym}&timestamp={ts}" if sym else f"timestamp={ts}"
-                headers_pos = get_headers(q_pos)
-                resp_pos = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q_pos}", headers=headers_pos, timeout=2)
-                if resp_pos.status_code == 200:
-                    res = resp_pos.json()
-                    positions = res.get("data", res) if isinstance(res, dict) else res
-                    if isinstance(positions, list):
-                        for pos in positions:
-                            raw_sym = str(pos.get("symbol", "")).replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
-                            if raw_sym == clean_target:
-                                entry_p = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
-                                if entry_p > 0:
-                                    print(f">>> [EXACT FILL DETECTED VIA POSITIONS] Entry Price: {entry_p}")
-                                    return entry_p
-
-            # 3. Check order history
-            for sym in variants:
-                q_hist = f"clientOrderId={client_order_id}&symbol={sym}&timestamp={ts}"
-                headers_hist = get_headers(q_hist)
-                resp_hist = requests.get(f"{SHARK_BASE_URL}/v1/order/order-history?{q_hist}", headers=headers_hist, timeout=2)
-                if resp_hist.status_code == 200:
-                    hist_data = resp_hist.json()
-                    orders = hist_data.get("data", hist_data) if isinstance(hist_data, dict) else hist_data
-                    if isinstance(orders, list) and len(orders) > 0:
-                        for o in orders:
-                            cid = str(o.get("clientOrderId", "") or o.get("orderId", ""))
-                            if client_order_id in cid or cid in client_order_id:
-                                avg_p = float(o.get("avgPrice") or o.get("price") or 0.0)
-                                if avg_p > 0:
-                                    print(f">>> [EXACT FILL DETECTED VIA ORDER-HISTORY] Executed Price: {avg_p}")
-                                    return avg_p
-
-        except Exception as e:
-            print(f"[FILL CHECK ATTEMPT {attempt + 1} ERROR]: {e}")
-
-    print(f">>> [LIMIT FALLBACK] Setting stop based on posted limit price: {fallback_price}")
-    return fallback_price
-
-
 def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: float, trade_id: int, quantity: float):
-    """Monitors order fill and places SL instantly upon confirmed execution."""
+    """
+    Conditions 6, 13 & 14:
+    Strictly verifies executed fill on the exchange before placing Stop Loss.
+    Never fires premature stops while the limit order is still resting unfilled.
+    """
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, ACTIVE_ENTRY_ORDER_ID, ACTIVE_SL_CLIENT_IDS
     is_buy = target_side == "BUY"
     start_time = time.time()
 
     print(f"[WATCHER] Polling Shark Exchange for {target_side} fill (Timeout: {ENTRY_ORDER_EXPIRATION_SECONDS}s)...")
 
+    # Grace period: allow 2.0s for the newly placed limit order to register on exchange books
+    time.sleep(2.0)
+
     while (time.time() - start_time) < ENTRY_ORDER_EXPIRATION_SECONDS:
-        time.sleep(0.4)
+        time.sleep(1.0)
+
         if CURRENT_TRADE_ID != trade_id:
             print(f"[WATCHER] Trade {trade_id} superseded. Exiting watcher.")
             return
@@ -438,14 +422,19 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
         if not ACTIVE_ENTRY_ORDER_ID:
             return
 
-        pos_size, _, _ = get_active_position_details(clean_symbol)
-        still_open = is_entry_order_open(ACTIVE_ENTRY_ORDER_ID, clean_symbol)
+        # 1. Primary check: Has an active position actually opened on the exchange?
+        pos_size, live_side, live_ep = get_active_position_details(clean_symbol)
 
-        if pos_size > 0 or not still_open:
-            print(f">>> [LIMIT FILLED] Resolving executed price instantly...")
+        # 2. Secondary check: Does order details explicitly confirm FILLED status?
+        is_filled, exec_price = check_order_strictly_filled(ACTIVE_ENTRY_ORDER_ID, clean_symbol)
+
+        # Proceed only if Shark Exchange verifies real execution
+        if (pos_size > 0 and live_side == target_side) or is_filled:
+            print(f">>> [REAL EXECUTION CONFIRMED] Limit Order filled on Shark Exchange!")
             CURRENT_POSITION_SIDE = target_side
 
-            real_fill_price = get_actual_fill_price(ACTIVE_ENTRY_ORDER_ID, clean_symbol, entry_price)
+            real_fill_price = live_ep if live_ep > 0 else (exec_price if exec_price > 0 else entry_price)
+            print(f">>> [TRUE FILL PRICE FROM EXCHANGE]: {real_fill_price}")
 
             initial_stop = round(real_fill_price - 100.0, 2) if is_buy else round(real_fill_price + 100.0, 2)
             sl_side = "SELL" if is_buy else "BUY"
@@ -457,6 +446,7 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
                 ACTIVE_SL_CLIENT_IDS.append(new_sl_id)
             return
 
+    # 600s Expiration Reached
     print(f"[WATCHER] Limit order timed out after {ENTRY_ORDER_EXPIRATION_SECONDS}s without filling. Canceling order...")
     with ORDER_EXECUTION_LOCK:
         cancel_pending_limit_entry()
@@ -529,11 +519,14 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
 
 def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_price: float, trade_id: int, fallback_side: str = None):
-    """Evaluates position state instantly and acquires lock only when placing orders."""
+    """
+    Evaluates position status instantly (no lock block) and updates the trailing stop cleanly.
+    """
     global CURRENT_POSITION_SIDE, CURRENT_TRADE_ID, ACTIVE_SL_CLIENT_IDS
     try:
         clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
 
+        # Immediate check outside of lock to avoid stalling when flat
         pos_size, live_side, _ = get_active_position_details(clean_symbol)
 
         resolved_side = None
@@ -546,6 +539,7 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
             resolved_side = fallback_side
             CURRENT_POSITION_SIDE = fallback_side
 
+        # Immediate rejection if no position exists anywhere
         if resolved_side is None:
             print(f"[REJECTED UPDATE_SL] No open trade found on exchange or in bot state. Discarding trailing SL.")
             return
@@ -557,6 +551,7 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
             print(f"[UPDATE_SL] Invalid stop price {stop_price}. Skipped.")
             return
 
+        # Acquire lock only during order modification
         with ORDER_EXECUTION_LOCK:
             CURRENT_TRADE_ID = trade_id
             clean_qty = float(f"{quantity:.4f}")
