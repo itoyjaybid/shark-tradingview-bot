@@ -20,7 +20,6 @@ app = FastAPI()
 # ==========================================
 # CONFIGURATION & RUNTIME STATE
 # ==========================================
-# Strip surrounding quotes and whitespace to avoid signature mismatches
 SHARK_BASE_URL = "https://api.sharkexchange.in"
 SHARK_API_KEY = os.getenv("SHARK_API_KEY", "").strip().strip("'").strip('"')
 SHARK_API_SECRET = os.getenv("SHARK_API_SECRET", "").strip().strip("'").strip('"')
@@ -193,7 +192,7 @@ def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, l
                 size, _ = get_active_position_details(clean_target)
                 if size > 0:
                     print(f"[EMERGENCY ACTIVATED] Liquidating immediately via Market Order...")
-                    cancel_all_tracked_stops()
+                    cancel_all_tracked_stops(clean_target)
                     emergency_market_close(clean_target, side, quantity)
                     CURRENT_POSITION_SIDE = None
                 else:
@@ -202,37 +201,54 @@ def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, l
 
 
 def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: float) -> float:
-    """Queries active positions and trade history to capture the real filled entry price."""
+    """
+    Directly queries order details, positions, and trade history
+    to capture the real executed fill price from Shark Exchange.
+    """
     clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
     hyphen_target = f"{clean_target[:-4]}-{clean_target[-4:]}" if clean_target.endswith("USDT") else clean_target
 
     for attempt in range(5):
         time.sleep(1.0)
         try:
-            for sym_variant in [hyphen_target, clean_target, ""]:
-                ts_pos = str(int(time.time() * 1000))
-                q = f"symbol={sym_variant}&timestamp={ts_pos}" if sym_variant else f"timestamp={ts_pos}"
-                headers = get_headers(q)
-                resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q}", headers=headers, timeout=5)
+            ts = str(int(time.time() * 1000))
 
-                if resp.status_code == 200:
-                    pos_data = resp.json()
+            # 1. Primary Check: Query order detail by clientOrderId
+            for sym_var in [clean_target, hyphen_target]:
+                q_detail = f"clientOrderId={client_order_id}&symbol={sym_var}&timestamp={ts}"
+                headers_detail = get_headers(q_detail)
+                resp_detail = requests.get(f"{SHARK_BASE_URL}/v1/order/order-detail?{q_detail}", headers=headers_detail, timeout=4)
+                if resp_detail.status_code == 200:
+                    detail_data = resp_detail.json()
+                    data = detail_data.get("data", detail_data) if isinstance(detail_data, dict) else detail_data
+                    if isinstance(data, dict):
+                        exec_price = float(data.get("avgPrice") or data.get("price") or data.get("executedPrice") or 0.0)
+                        if exec_price > 0:
+                            print(f">>> [FOUND REAL ENTRY VIA ORDER-DETAIL] Executed price: {exec_price}")
+                            return exec_price
+
+            # 2. Secondary Check: Live positions average price
+            for sym_variant in [clean_target, hyphen_target, ""]:
+                q_pos = f"symbol={sym_variant}&timestamp={ts}" if sym_variant else f"timestamp={ts}"
+                headers_pos = get_headers(q_pos)
+                resp_pos = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q_pos}", headers=headers_pos, timeout=4)
+                if resp_pos.status_code == 200:
+                    pos_data = resp_pos.json()
                     positions = pos_data.get("data", pos_data) if isinstance(pos_data, dict) else pos_data
                     if isinstance(positions, list):
                         for pos in positions:
                             raw_sym = str(pos.get("symbol", "")).replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
                             if raw_sym == clean_target:
-                                entry_p = float(pos.get("entryPrice") or pos.get("avgCost") or pos.get("avgPrice") or pos.get("price") or 0.0)
+                                entry_p = float(pos.get("entryPrice") or pos.get("avgPrice") or pos.get("avgCost") or pos.get("price") or 0.0)
                                 if entry_p > 0:
-                                    print(f">>> [FOUND REAL ENTRY] Position entry price: {entry_p}")
+                                    print(f">>> [FOUND REAL ENTRY VIA POSITION] Position entry price: {entry_p}")
                                     return entry_p
 
-            ts2 = str(int(time.time() * 1000))
-            for sym_var in [hyphen_target, clean_target]:
-                query_str2 = f"symbol={sym_var}&timestamp={ts2}"
+            # 3. Tertiary Check: Trade history
+            for sym_var in [clean_target, hyphen_target]:
+                query_str2 = f"symbol={sym_var}&timestamp={ts}"
                 headers2 = get_headers(query_str2)
-                resp2 = requests.get(f"{SHARK_BASE_URL}/v1/order/trade-history?{query_str2}", headers=headers2, timeout=5)
-
+                resp2 = requests.get(f"{SHARK_BASE_URL}/v1/order/trade-history?{query_str2}", headers=headers2, timeout=4)
                 if resp2.status_code == 200:
                     trades_data = resp2.json()
                     trades = trades_data.get("data", trades_data) if isinstance(trades_data, dict) else trades_data
@@ -242,50 +258,74 @@ def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: flo
                             if client_order_id in t_cid or t_cid in client_order_id:
                                 trade_price = float(trade.get("price") or trade.get("executedPrice") or 0.0)
                                 if trade_price > 0:
-                                    print(f">>> [FOUND REAL ENTRY] Trade history price: {trade_price}")
+                                    print(f">>> [FOUND REAL ENTRY VIA TRADE-HISTORY] Trade price: {trade_price}")
                                     return trade_price
 
         except Exception as e:
             print(f"[FETCH ATTEMPT {attempt + 1} ERROR]: {e}")
 
-    print(f"[WARN] Failed to find live position for {clean_target}, falling back to: {fallback_price}")
+    print(f"[WARN] Could not resolve exact fill price from exchange, falling back to: {fallback_price}")
     return fallback_price
 
 
-def delete_single_order(client_order_id: str) -> bool:
+def delete_single_order(client_order_id: str, symbol: str = "BTCUSDT") -> bool:
+    """
+    Cancels an order on Shark Exchange using both query string and JSON body fallbacks,
+    ensuring symbol is passed so the order is purged from the book.
+    """
     try:
+        clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
         ts = str(int(time.time() * 1000))
-        payload = {"clientOrderId": str(client_order_id), "timestamp": ts}
-        body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-        headers = get_headers(body)
 
+        # Method 1: Cancel via Query Parameters
+        query_str = f"clientOrderId={client_order_id}&symbol={clean_target}&timestamp={ts}"
+        headers_q = get_headers(query_str)
         resp = requests.delete(
-            f"{SHARK_BASE_URL}/v1/order/delete-order",
-            data=body.encode("utf-8"),
-            headers=headers,
+            f"{SHARK_BASE_URL}/v1/order/delete-order?{query_str}",
+            headers=headers_q,
             timeout=5
         )
-        print(f"[CLEANUP] Canceled order ({client_order_id}) -> HTTP {resp.status_code} | Body: {resp.text.strip()}")
-        return resp.status_code in [200, 201, 204]
+        print(f"[CLEANUP QUERY] Cancel ({client_order_id}) -> HTTP {resp.status_code} | {resp.text.strip()}")
+
+        if resp.status_code in [200, 201, 204]:
+            return True
+
+        # Method 2: Fallback via JSON Body
+        payload = {
+            "clientOrderId": str(client_order_id),
+            "symbol": clean_target,
+            "timestamp": ts
+        }
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        headers_b = get_headers(body)
+        resp_b = requests.delete(
+            f"{SHARK_BASE_URL}/v1/order/delete-order",
+            data=body.encode("utf-8"),
+            headers=headers_b,
+            timeout=5
+        )
+        print(f"[CLEANUP BODY] Cancel ({client_order_id}) -> HTTP {resp_b.status_code} | {resp_b.text.strip()}")
+        return resp_b.status_code in [200, 201, 204]
+
     except Exception as e:
         print(f"[CLEANUP ERROR]: {e}")
         return False
 
 
-def cancel_all_tracked_stops():
+def cancel_all_tracked_stops(symbol: str = "BTCUSDT"):
     global ACTIVE_SL_CLIENT_IDS
     if not ACTIVE_SL_CLIENT_IDS:
         return
     for cid in list(ACTIVE_SL_CLIENT_IDS):
-        delete_single_order(cid)
+        delete_single_order(cid, symbol)
     ACTIVE_SL_CLIENT_IDS = []
 
 
-def cancel_pending_limit_entry():
+def cancel_pending_limit_entry(symbol: str = "BTCUSDT"):
     global ACTIVE_ENTRY_ORDER_ID
     if ACTIVE_ENTRY_ORDER_ID:
         print(f"[ENTRY CLEANUP] Canceling pending limit entry: {ACTIVE_ENTRY_ORDER_ID}")
-        delete_single_order(ACTIVE_ENTRY_ORDER_ID)
+        delete_single_order(ACTIVE_ENTRY_ORDER_ID, symbol)
         ACTIVE_ENTRY_ORDER_ID = None
 
 
@@ -403,7 +443,7 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
 
     print(f"[WATCHER] Limit order timed out after {ENTRY_ORDER_EXPIRATION_SECONDS}s without filling. Canceling order...")
     with ORDER_EXECUTION_LOCK:
-        cancel_pending_limit_entry()
+        cancel_pending_limit_entry(clean_symbol)
         CURRENT_POSITION_SIDE = None
 
 
@@ -415,9 +455,9 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             clean_price = float(f"{target_limit_price:.2f}")
             clean_qty = float(f"{quantity:.4f}")
 
-            # 1. Clean previous state
-            cancel_pending_limit_entry()
-            cancel_all_tracked_stops()
+            # 1. Cancel previous resting entry & stop orders
+            cancel_pending_limit_entry(clean_symbol)
+            cancel_all_tracked_stops(clean_symbol)
 
             # 2. Auto-Reversal check: close existing opposite trade at market
             close_position_immediately(clean_symbol)
@@ -442,7 +482,6 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
                 "userCategory": "EXTERNAL"
             }
 
-            # Serialize payload cleanly
             entry_body = json.dumps(entry_params, separators=(",", ":"), sort_keys=True)
             entry_headers = get_headers(entry_body)
 
@@ -514,7 +553,7 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
             if new_sl_id:
                 old_stops = [cid for cid in ACTIVE_SL_CLIENT_IDS if cid != new_sl_id]
                 for old_cid in old_stops:
-                    delete_single_order(old_cid)
+                    delete_single_order(old_cid, clean_symbol)
                 ACTIVE_SL_CLIENT_IDS = [new_sl_id]
                 print(f">>> [TRAILING SL UPDATED] Active stop is now {new_sl_id} at {stop_price}")
             else:
