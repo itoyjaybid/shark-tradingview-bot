@@ -20,12 +20,12 @@ app = FastAPI()
 # ==========================================
 # CONFIGURATION & RUNTIME STATE
 # ==========================================
+# Strip surrounding quotes and whitespace to avoid signature mismatches
 SHARK_BASE_URL = "https://api.sharkexchange.in"
-SHARK_API_KEY = os.getenv("SHARK_API_KEY", "").strip()
-SHARK_API_SECRET = os.getenv("SHARK_API_SECRET", "").strip()
-WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MY_SECRET_KEY").strip()
+SHARK_API_KEY = os.getenv("SHARK_API_KEY", "").strip().strip("'").strip('"')
+SHARK_API_SECRET = os.getenv("SHARK_API_SECRET", "").strip().strip("'").strip('"')
+WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MY_SECRET_KEY").strip().strip("'").strip('"')
 
-# Order entry expiration timeout in seconds (10 minutes = 600s)
 ENTRY_ORDER_EXPIRATION_SECONDS = 600
 
 CURRENT_TRADE_ID = None
@@ -102,8 +102,6 @@ def get_active_position_details(symbol: str):
     """
     Queries Shark Exchange positions using multiple lookup formats.
     Returns (position_size, side).
-    size: positive float (e.g. 0.002).
-    side: 'BUY' (Long) or 'SELL' (Short) or None.
     """
     try:
         clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
@@ -294,14 +292,12 @@ def cancel_pending_limit_entry():
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0) -> str:
     """
     Submits a STOP_LIMIT order and returns the clientOrderId upon success.
-    Safely validates stop price against live ticker if payload ref_price is identical or invalid.
+    Validates against live market ticker if ref_price creates an identical/invalid boundary.
     """
     global ACTIVE_SL_CLIENT_IDS, CURRENT_TRADE_ID
     try:
         clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
 
-        # If payload price is invalid or creates a false conflict (e.g. ref_price == stop_price),
-        # pull live market price from the exchange ticker.
         if ref_price <= 0 or (side == "SELL" and stop_price >= ref_price) or (side == "BUY" and stop_price <= ref_price):
             live_mkt = get_current_market_price(clean_target)
             if live_mkt > 0:
@@ -446,6 +442,7 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
                 "userCategory": "EXTERNAL"
             }
 
+            # Serialize payload cleanly
             entry_body = json.dumps(entry_params, separators=(",", ":"), sort_keys=True)
             entry_headers = get_headers(entry_body)
 
@@ -487,7 +484,7 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
             stop_price = float(f"{sl_price:.2f}")
             ref_price = float(f"{current_price:.2f}") if current_price else 0.0
 
-            # 1. Recover from alert payload fallback_side if server restarted
+            # 1. Recover from alert fallback_side if server restarted
             if CURRENT_POSITION_SIDE is None and fallback_side in ["BUY", "SELL"]:
                 CURRENT_POSITION_SIDE = fallback_side
                 print(f"[RECOVERY] Restored Position Side from alert: {CURRENT_POSITION_SIDE}")
@@ -509,11 +506,11 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
 
             sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
 
-            # 3. Place the new STOP_LIMIT FIRST (Atomic switch)
+            # 3. Place new STOP_LIMIT first
             print(f"[UPDATE_SL] Submitting new {sl_side} Stop to {stop_price}...")
             new_sl_id = place_stop_loss(clean_symbol, sl_side, clean_qty, stop_price, ref_price)
 
-            # 4. ONLY delete old stop orders if the new stop order was confirmed
+            # 4. Only delete older stop orders if the new one was confirmed
             if new_sl_id:
                 old_stops = [cid for cid in ACTIVE_SL_CLIENT_IDS if cid != new_sl_id]
                 for old_cid in old_stops:
