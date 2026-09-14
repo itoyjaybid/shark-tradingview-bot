@@ -9,7 +9,7 @@ import requests
 import threading
 import urllib3.util.connection as urllib3_cn
 
-# Force IPv4 resolution for reliable cloud communication
+# Force IPv4 network routing for cloud deployment reliability
 def allowed_gai_family():
     return socket.AF_INET
 
@@ -25,6 +25,7 @@ SHARK_API_KEY = os.getenv("SHARK_API_KEY", "").strip().strip("'").strip('"')
 SHARK_API_SECRET = os.getenv("SHARK_API_SECRET", "").strip().strip("'").strip('"')
 WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MY_SECRET_KEY").strip().strip("'").strip('"')
 
+# Condition 6 & 10: Limit entry timeout duration (seconds)
 ENTRY_ORDER_EXPIRATION_SECONDS = 600
 
 CURRENT_TRADE_ID = None
@@ -76,7 +77,7 @@ def is_entry_order_open(client_order_id: str, symbol: str) -> bool:
         return False
     except Exception as e:
         print(f"[STATUS CHECK ERROR]: {e}")
-        return True  # Fail-safe: assume still open during transient network drops to prevent false fills
+        return True  # Fail-safe: assume still open during transient network drops
 
 
 def get_current_market_price(symbol: str) -> float:
@@ -175,15 +176,15 @@ def delete_single_order(client_order_id: str) -> bool:
     for payload in payload_variants:
         try:
             body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-            headers = get_headers(body)
-            resp = requests.delete(
+            headers_b = get_headers(body)
+            resp_b = requests.delete(
                 f"{SHARK_BASE_URL}/v1/order/delete-order",
                 data=body.encode("utf-8"),
-                headers=headers,
+                headers=headers_b,
                 timeout=3
             )
-            print(f"[CLEANUP] Cancel order ({client_order_id}) -> HTTP {resp.status_code} | {resp.text.strip()}")
-            if resp.status_code in [200, 201, 204]:
+            print(f"[CLEANUP] Cancel order ({client_order_id}) -> HTTP {resp_b.status_code} | {resp_b.text.strip()}")
+            if resp_b.status_code in [200, 201, 204]:
                 return True
         except Exception as e:
             print(f"[CLEANUP ERROR]: {e}")
@@ -353,20 +354,39 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
 
 def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: float) -> float:
-    """Fast, low-latency entry fill lookup without delaying stop placement."""
+    """
+    Condition 14: Accurately retrieves real fill price (avgPrice) from Shark Exchange 
+    across 6 polling checks (3.0 seconds total) before falling back.
+    """
     clean_target = symbol.replace("-", "").replace("_", "").replace(".P", "").replace("/", "").upper()
     variants = get_symbol_variants(symbol)
 
-    for _ in range(2):
-        time.sleep(0.25)
+    for attempt in range(6):
+        time.sleep(0.5)
         try:
             ts = str(int(time.time() * 1000))
+
+            # 1. Check order details by clientOrderId
+            for sym in variants:
+                q_detail = f"clientOrderId={client_order_id}&symbol={sym}&timestamp={ts}"
+                headers_detail = get_headers(q_detail)
+                resp_detail = requests.get(f"{SHARK_BASE_URL}/v1/order/order-detail?{q_detail}", headers=headers_detail, timeout=2)
+                if resp_detail.status_code == 200:
+                    data = resp_detail.json()
+                    item = data.get("data", data) if isinstance(data, dict) else data
+                    if isinstance(item, dict):
+                        exec_price = float(item.get("avgPrice") or item.get("price") or item.get("executedPrice") or 0.0)
+                        if exec_price > 0:
+                            print(f">>> [EXACT FILL DETECTED VIA ORDER-DETAIL] Executed Price: {exec_price}")
+                            return exec_price
+
+            # 2. Check live position avg entry price
             for sym in variants + [""]:
                 q_pos = f"symbol={sym}&timestamp={ts}" if sym else f"timestamp={ts}"
-                headers = get_headers(q_pos)
-                resp = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q_pos}", headers=headers, timeout=2)
-                if resp.status_code == 200:
-                    res = resp.json()
+                headers_pos = get_headers(q_pos)
+                resp_pos = requests.get(f"{SHARK_BASE_URL}/v1/positions?{q_pos}", headers=headers_pos, timeout=2)
+                if resp_pos.status_code == 200:
+                    res = resp_pos.json()
                     positions = res.get("data", res) if isinstance(res, dict) else res
                     if isinstance(positions, list):
                         for pos in positions:
@@ -374,13 +394,30 @@ def get_actual_fill_price(client_order_id: str, symbol: str, fallback_price: flo
                             if raw_sym == clean_target:
                                 entry_p = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
                                 if entry_p > 0:
-                                    print(f">>> [INSTANT FILL DETECTED] Position entry price: {entry_p}")
+                                    print(f">>> [EXACT FILL DETECTED VIA POSITIONS] Entry Price: {entry_p}")
                                     return entry_p
-        except Exception as e:
-            print(f"[FAST FILL ERROR]: {e}")
 
-    # For Limit orders, execution is guaranteed at or better than the target limit price
-    print(f">>> [SYNCED FILL] Entry confirmed at order limit price: {fallback_price}")
+            # 3. Check order history
+            for sym in variants:
+                q_hist = f"clientOrderId={client_order_id}&symbol={sym}&timestamp={ts}"
+                headers_hist = get_headers(q_hist)
+                resp_hist = requests.get(f"{SHARK_BASE_URL}/v1/order/order-history?{q_hist}", headers=headers_hist, timeout=2)
+                if resp_hist.status_code == 200:
+                    hist_data = resp_hist.json()
+                    orders = hist_data.get("data", hist_data) if isinstance(hist_data, dict) else hist_data
+                    if isinstance(orders, list) and len(orders) > 0:
+                        for o in orders:
+                            cid = str(o.get("clientOrderId", "") or o.get("orderId", ""))
+                            if client_order_id in cid or cid in client_order_id:
+                                avg_p = float(o.get("avgPrice") or o.get("price") or 0.0)
+                                if avg_p > 0:
+                                    print(f">>> [EXACT FILL DETECTED VIA ORDER-HISTORY] Executed Price: {avg_p}")
+                                    return avg_p
+
+        except Exception as e:
+            print(f"[FILL CHECK ATTEMPT {attempt + 1} ERROR]: {e}")
+
+    print(f">>> [LIMIT FALLBACK] Setting stop based on posted limit price: {fallback_price}")
     return fallback_price
 
 
@@ -401,7 +438,6 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
         if not ACTIVE_ENTRY_ORDER_ID:
             return
 
-        # Double Confirmation to avoid race conditions
         pos_size, _, _ = get_active_position_details(clean_symbol)
         still_open = is_entry_order_open(ACTIVE_ENTRY_ORDER_ID, clean_symbol)
 
@@ -421,7 +457,6 @@ def wait_for_fill_and_set_sl(clean_symbol: str, target_side: str, entry_price: f
                 ACTIVE_SL_CLIENT_IDS.append(new_sl_id)
             return
 
-    # 600s Expiration Reached
     print(f"[WATCHER] Limit order timed out after {ENTRY_ORDER_EXPIRATION_SECONDS}s without filling. Canceling order...")
     with ORDER_EXECUTION_LOCK:
         cancel_pending_limit_entry()
@@ -494,14 +529,11 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
 
 def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_price: float, trade_id: int, fallback_side: str = None):
-    """
-    Evaluates position status instantly (no lock block) and updates the trailing stop cleanly.
-    """
+    """Evaluates position state instantly and acquires lock only when placing orders."""
     global CURRENT_POSITION_SIDE, CURRENT_TRADE_ID, ACTIVE_SL_CLIENT_IDS
     try:
         clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
 
-        # Immediate check outside of lock to avoid stalling when flat
         pos_size, live_side, _ = get_active_position_details(clean_symbol)
 
         resolved_side = None
@@ -514,7 +546,6 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
             resolved_side = fallback_side
             CURRENT_POSITION_SIDE = fallback_side
 
-        # Immediate rejection if no position exists anywhere
         if resolved_side is None:
             print(f"[REJECTED UPDATE_SL] No open trade found on exchange or in bot state. Discarding trailing SL.")
             return
@@ -526,7 +557,6 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
             print(f"[UPDATE_SL] Invalid stop price {stop_price}. Skipped.")
             return
 
-        # Acquire lock only during order modification
         with ORDER_EXECUTION_LOCK:
             CURRENT_TRADE_ID = trade_id
             clean_qty = float(f"{quantity:.4f}")
