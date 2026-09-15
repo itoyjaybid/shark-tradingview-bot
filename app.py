@@ -17,7 +17,7 @@ def allowed_gai_family():
 urllib3_cn.allowed_gai_family = allowed_gai_family
 
 # =============================================================================
-# ENVIRONMENT VARIABLES & GLOBAL CONFIGURATION
+# ENVIRONMENT VARIABLES & CONFIGURATION
 # =============================================================================
 SHARK_BASE_URL = "https://api.sharkexchange.in"
 SHARK_API_KEY = os.getenv("SHARK_API_KEY", "").strip().strip("'").strip('"')
@@ -26,27 +26,54 @@ WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MY_SECRET_KEY").strip().st
 
 ENTRY_ORDER_EXPIRATION_SECONDS = 600
 DEFAULT_SYMBOL = "BTCUSDT"
+STATE_FILE_PATH = "state.json"
 
 SERVER_TIME_OFFSET_MS = 0
-
-# Authoritative Execution State
-CURRENT_TRADE_ID = None
-CURRENT_POSITION_SIDE = None
-CURRENT_POSITION_QTY = 0.0
-ACTIVE_SL_CLIENT_IDS = []
-ACTIVE_ENTRY_ORDER_ID = None
-
 ORDER_EXECUTION_LOCK = threading.Lock()
 
+# Persistent state schema template
+BOT_STATE = {
+    "trade_id": None,
+    "position_side": None,
+    "position_qty": 0.0,
+    "active_sl_client_ids": [],
+    "active_entry_order_id": None
+}
+
 
 # =============================================================================
-# TIME SYNC & AUTHENTICATION
+# STATE PERSISTENCE (Survives Render Container Restarts / Freezes)
+# =============================================================================
+def load_state_from_disk():
+    """Restores bot trade memory across container recycles."""
+    global BOT_STATE
+    if os.path.exists(STATE_FILE_PATH):
+        try:
+            with open(STATE_FILE_PATH, "r") as f:
+                loaded = json.load(f)
+                BOT_STATE.update(loaded)
+                print(f"[STATE LOADED] TradeID: {BOT_STATE['trade_id']} | Side: {BOT_STATE['position_side']} | Qty: {BOT_STATE['position_qty']}")
+        except Exception as e:
+            print(f"[STATE LOAD ERROR]: {e}")
+
+
+def save_state_to_disk():
+    """Flushes active state to persistent file storage immediately."""
+    try:
+        with open(STATE_FILE_PATH, "w") as f:
+            json.dump(BOT_STATE, f, indent=2)
+    except Exception as e:
+        print(f"[STATE SAVE ERROR]: {e}")
+
+
+# =============================================================================
+# TIME SYNCHRONIZATION & AUTHENTICATION
 # =============================================================================
 def sync_exchange_time():
-    """Calculates clock drift between Render container and Shark Exchange."""
+    """Calculates clock drift to eliminate 4007 Signature Mismatches."""
     global SERVER_TIME_OFFSET_MS
     try:
-        resp = requests.get(f"{SHARK_BASE_URL}/v1/time", timeout=2)
+        resp = requests.get(f"{SHARK_BASE_URL}/v1/time", timeout=3)
         if resp.status_code == 200:
             res_data = resp.json()
             server_ts = int(res_data.get("serverTime") or res_data.get("data") or 0)
@@ -55,18 +82,19 @@ def sync_exchange_time():
                 diff = server_ts - local_ts
                 if abs(diff) < 60000:
                     SERVER_TIME_OFFSET_MS = diff
-                    print(f"[TIME SYNC] Offset adjusted: {SERVER_TIME_OFFSET_MS}ms")
+                    print(f"[TIME SYNC] Offset aligned: {SERVER_TIME_OFFSET_MS}ms")
     except Exception as e:
         print(f"[TIME SYNC WARN]: {e}")
 
 
 def get_current_ts_int() -> int:
-    """Returns local epoch milliseconds adjusted by exchange drift as an INTEGER."""
+    """Returns local epoch milliseconds adjusted by exchange drift as a raw INT."""
     return int(time.time() * 1000) + SERVER_TIME_OFFSET_MS
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    load_state_from_disk()
     sync_exchange_time()
     yield
 
@@ -75,7 +103,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 def get_headers(payload_or_querystr: str) -> dict:
-    """Computes HMAC-SHA256 signature required by Shark Exchange."""
+    """Generates Shark HMAC-SHA256 authenticated headers."""
     sig = hmac.new(
         SHARK_API_SECRET.encode("utf-8"),
         payload_or_querystr.encode("utf-8"),
@@ -96,7 +124,7 @@ def clean_symbol(sym: str) -> str:
 
 
 # =============================================================================
-# EXCHANGE DATA LOOKUPS
+# EXCHANGE DATA LOOKUPS & ORDER CHECKS
 # =============================================================================
 def get_current_market_price(symbol: str = DEFAULT_SYMBOL) -> float:
     target = clean_symbol(symbol)
@@ -118,12 +146,10 @@ def get_current_market_price(symbol: str = DEFAULT_SYMBOL) -> float:
 
 
 def check_order_status(client_order_id: str, symbol: str = DEFAULT_SYMBOL) -> tuple[str, float]:
-    """Checks exact status of an order via order-detail."""
+    """Retrieves authoritative execution status and average executed fill price."""
     target = clean_symbol(symbol)
     ts = str(get_current_ts_int())
-    variants = [target, f"{target[:-4]}-{target[-4:]}"]
-
-    for sym in variants:
+    for sym in [target, f"{target[:-4]}-{target[-4:]}"]:
         try:
             query = f"clientOrderId={client_order_id}&symbol={sym}&timestamp={ts}"
             headers = get_headers(query)
@@ -138,12 +164,11 @@ def check_order_status(client_order_id: str, symbol: str = DEFAULT_SYMBOL) -> tu
                         return status, ep
         except Exception:
             continue
-
     return "UNKNOWN", 0.0
 
 
 def is_order_in_open_book(client_order_id: str, symbol: str = DEFAULT_SYMBOL) -> bool:
-    """Checks if order is still active in the limit order book."""
+    """Verifies whether an order is actively resting on the order book."""
     target = clean_symbol(symbol)
     ts = str(get_current_ts_int())
     for sym in [target, f"{target[:-4]}-{target[-4:]}"]:
@@ -165,7 +190,7 @@ def is_order_in_open_book(client_order_id: str, symbol: str = DEFAULT_SYMBOL) ->
 
 
 def delete_single_order(client_order_id: str) -> bool:
-    """Cancels order via strict JSON schema (int timestamp, no symbol)."""
+    """Deletes order using pure minimal JSON schema (int timestamp, no symbol)."""
     payload = {
         "clientOrderId": str(client_order_id),
         "timestamp": get_current_ts_int()
@@ -187,24 +212,26 @@ def delete_single_order(client_order_id: str) -> bool:
 
 
 def cancel_all_tracked_stops():
-    global ACTIVE_SL_CLIENT_IDS
-    if not ACTIVE_SL_CLIENT_IDS:
-        return
-    for cid in list(ACTIVE_SL_CLIENT_IDS):
+    """Purges all tracked stop losses on exchange and clears state."""
+    sl_ids = list(BOT_STATE.get("active_sl_client_ids", []))
+    for cid in sl_ids:
         delete_single_order(cid)
-    ACTIVE_SL_CLIENT_IDS = []
+    BOT_STATE["active_sl_client_ids"] = []
+    save_state_to_disk()
 
 
 def cancel_pending_limit_entry():
-    global ACTIVE_ENTRY_ORDER_ID
-    if ACTIVE_ENTRY_ORDER_ID:
-        print(f"[ENTRY CLEANUP] Canceling pending limit entry: {ACTIVE_ENTRY_ORDER_ID}")
-        delete_single_order(ACTIVE_ENTRY_ORDER_ID)
-        ACTIVE_ENTRY_ORDER_ID = None
+    """Cancels any active resting limit entry order."""
+    entry_id = BOT_STATE.get("active_entry_order_id")
+    if entry_id:
+        print(f"[ENTRY CLEANUP] Canceling limit entry: {entry_id}")
+        delete_single_order(entry_id)
+        BOT_STATE["active_entry_order_id"] = None
+        save_state_to_disk()
 
 
 def emergency_market_close(symbol: str, side: str, quantity: float):
-    """Executes a reduceOnly MARKET order with an int timestamp."""
+    """Executes an immediate reduceOnly MARKET order."""
     target = clean_symbol(symbol)
     close_params = {
         "deviceType": "WEB",
@@ -228,52 +255,51 @@ def emergency_market_close(symbol: str, side: str, quantity: float):
 
 
 def liquidate_prior_position_if_any(symbol: str):
-    """Closes prior position immediately upon reversal alert."""
-    global CURRENT_POSITION_SIDE, CURRENT_POSITION_QTY
-    if CURRENT_POSITION_SIDE in ["BUY", "SELL"] and CURRENT_POSITION_QTY > 0:
-        close_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
-        print(f"[AUTO-REVERSAL] Active position detected: {CURRENT_POSITION_SIDE} ({CURRENT_POSITION_QTY} BTC). Liquidating via {close_side} MARKET...")
-        emergency_market_close(symbol, close_side, CURRENT_POSITION_QTY)
-        CURRENT_POSITION_SIDE = None
-        CURRENT_POSITION_QTY = 0.0
+    """Guarantees full market liquidation of prior trades before opening new positions."""
+    side = BOT_STATE.get("position_side")
+    qty = BOT_STATE.get("position_qty", 0.0)
+
+    if side in ["BUY", "SELL"] and qty > 0:
+        close_side = "SELL" if side == "BUY" else "BUY"
+        print(f"[AUTO-REVERSAL] Active position verified: {side} ({qty} BTC). Liquidating via {close_side} MARKET...")
+        emergency_market_close(symbol, close_side, qty)
+        BOT_STATE["position_side"] = None
+        BOT_STATE["position_qty"] = 0.0
+        save_state_to_disk()
         time.sleep(0.5)
     else:
-        print("[AUTO-REVERSAL] No prior active position tracked in bot state. Proceeding with clean slate.")
+        print("[AUTO-REVERSAL] State clean. No prior active position to liquidate.")
 
 
 def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, limit_price: float, sl_client_id: str, trade_id: int):
-    """Watchdog thread to sweep market close if price gaps past stop limit."""
-    global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, CURRENT_POSITION_QTY
+    """Sweeps execution via market close if stop price is breached with zero fills."""
     is_buying_back = side == "BUY"
     target = clean_symbol(symbol)
 
-    while sl_client_id in ACTIVE_SL_CLIENT_IDS and CURRENT_TRADE_ID == trade_id:
+    while sl_client_id in BOT_STATE.get("active_sl_client_ids", []) and BOT_STATE.get("trade_id") == trade_id:
         time.sleep(0.8)
         curr_price = get_current_market_price(target)
         if curr_price <= 0.0:
             continue
 
-        spike_short = is_buying_back and (curr_price > limit_price)
-        spike_long = (not is_buying_back) and (curr_price < limit_price)
-
-        if spike_short or spike_long:
+        breached = (is_buying_back and curr_price > limit_price) or ((not is_buying_back) and curr_price < limit_price)
+        if breached:
             print(f"\n[SPIKE DETECTED] Price ({curr_price}) breached limit buffer ({limit_price})!")
             with ORDER_EXECUTION_LOCK:
-                if CURRENT_POSITION_SIDE is not None:
-                    print(f"[EMERGENCY ACTIVATED] Liquidating immediately via Market Order...")
+                if BOT_STATE.get("position_side") is not None:
+                    print("[EMERGENCY ACTIVATED] Liquidating immediately via Market Order...")
                     cancel_all_tracked_stops()
                     emergency_market_close(target, side, quantity)
-                    CURRENT_POSITION_SIDE = None
-                    CURRENT_POSITION_QTY = 0.0
+                    BOT_STATE["position_side"] = None
+                    BOT_STATE["position_qty"] = 0.0
+                    save_state_to_disk()
             break
 
 
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float) -> str:
-    """Submits STOP_LIMIT order directly to Shark Exchange."""
-    global ACTIVE_SL_CLIENT_IDS, CURRENT_TRADE_ID
+    """Submits a STOP_LIMIT order with a 15-point limit buffer directly to Shark."""
     try:
         target = clean_symbol(symbol)
-
         offset = 15.0
         limit_price = round(stop_price - offset, 2) if side == "SELL" else round(stop_price + offset, 2)
         clean_stop = float(f"{stop_price:.2f}")
@@ -313,7 +339,7 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float) 
                 print(f">>> [SUCCESS] STOP_LIMIT Placed at {clean_stop} | ID: {cid}")
                 threading.Thread(
                     target=monitor_slippage_and_market_close,
-                    args=(target, side, clean_qty, clean_limit, cid, CURRENT_TRADE_ID),
+                    args=(target, side, clean_qty, clean_limit, cid, BOT_STATE.get("trade_id")),
                     daemon=True
                 ).start()
                 return cid
@@ -326,20 +352,19 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float) 
 
 
 def wait_for_fill_and_set_sl(symbol: str, target_side: str, entry_price: float, trade_id: int, quantity: float, order_id: str):
-    """Watches entry order fill and places stop-loss calculated from exact fill price."""
-    global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, CURRENT_POSITION_QTY, ACTIVE_ENTRY_ORDER_ID, ACTIVE_SL_CLIENT_IDS
+    """Monitors fill and sets protective 100 pt stop based strictly on the accurate fill price."""
     target = clean_symbol(symbol)
     is_buy = target_side == "BUY"
     start_time = time.time()
 
-    print(f"[WATCHER] Polling order {order_id} for fill (Timeout: {ENTRY_ORDER_EXPIRATION_SECONDS}s)...")
+    print(f"[WATCHER] Polling order {order_id} for execution (Timeout: {ENTRY_ORDER_EXPIRATION_SECONDS}s)...")
     time.sleep(1.5)
 
     while (time.time() - start_time) < ENTRY_ORDER_EXPIRATION_SECONDS:
         time.sleep(1.0)
 
-        if CURRENT_TRADE_ID != trade_id:
-            print(f"[WATCHER] Trade {trade_id} superseded. Exiting watcher.")
+        if BOT_STATE.get("trade_id") != trade_id:
+            print(f"[WATCHER] Trade {trade_id} superseded. Terminating watcher.")
             return
 
         status, exec_price = check_order_status(order_id, target)
@@ -348,7 +373,7 @@ def wait_for_fill_and_set_sl(symbol: str, target_side: str, entry_price: float, 
         if status in ["FILLED", "SUCCESS", "EXECUTED"] or (not is_open and status != "CANCELED"):
             print(f">>> [REAL EXECUTION CONFIRMED] Limit order {order_id} filled!")
 
-            # Micro-poll for true executed fill price
+            # Micro-poll loop captures true executed price including positive price improvements
             real_fill_price = exec_price
             if real_fill_price <= 0:
                 for _ in range(4):
@@ -363,8 +388,9 @@ def wait_for_fill_and_set_sl(symbol: str, target_side: str, entry_price: float, 
 
             print(f">>> [ACCURATE FILL PRICE RESOLVED]: {real_fill_price}")
 
-            CURRENT_POSITION_SIDE = target_side
-            CURRENT_POSITION_QTY = quantity
+            BOT_STATE["position_side"] = target_side
+            BOT_STATE["position_qty"] = quantity
+            save_state_to_disk()
 
             initial_stop = round(real_fill_price - 100.0, 2) if is_buy else round(real_fill_price + 100.0, 2)
             sl_side = "SELL" if is_buy else "BUY"
@@ -372,17 +398,17 @@ def wait_for_fill_and_set_sl(symbol: str, target_side: str, entry_price: float, 
             cancel_all_tracked_stops()
             new_sl_id = place_stop_loss(target, sl_side, quantity, initial_stop)
             if new_sl_id:
-                ACTIVE_SL_CLIENT_IDS.append(new_sl_id)
+                BOT_STATE["active_sl_client_ids"].append(new_sl_id)
+                save_state_to_disk()
             return
 
-    print(f"[WATCHER] Limit order timed out after {ENTRY_ORDER_EXPIRATION_SECONDS}s without filling. Canceling...")
+    print(f"[WATCHER] Limit order timed out after {ENTRY_ORDER_EXPIRATION_SECONDS}s. Canceling...")
     with ORDER_EXECUTION_LOCK:
         cancel_pending_limit_entry()
 
 
 def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_price: float, trade_id: int):
-    """Liquidates opposing prior position, cleans up stops, and places LIMIT entry with int timestamp."""
-    global CURRENT_POSITION_SIDE, CURRENT_POSITION_QTY, CURRENT_TRADE_ID, ACTIVE_ENTRY_ORDER_ID
+    """Executes clean reversal, synchronization, and entry order placement."""
     with ORDER_EXECUTION_LOCK:
         try:
             target = clean_symbol(symbol)
@@ -397,7 +423,9 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
             is_buy_intent = "BUY" in action.upper()
             side = "BUY" if is_buy_intent else "SELL"
-            CURRENT_TRADE_ID = trade_id
+
+            BOT_STATE["trade_id"] = trade_id
+            save_state_to_disk()
 
             ts_int = get_current_ts_int()
             entry_params = {
@@ -427,12 +455,14 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
             if resp_entry.status_code in [200, 201]:
                 res_data = resp_entry.json()
-                ACTIVE_ENTRY_ORDER_ID = res_data.get("clientOrderId") or res_data.get("data", {}).get("clientOrderId")
-                print(f">>> [SUCCESS] Limit Entry Posted. Order ID: {ACTIVE_ENTRY_ORDER_ID}")
+                cid = res_data.get("clientOrderId") or res_data.get("data", {}).get("clientOrderId")
+                BOT_STATE["active_entry_order_id"] = cid
+                save_state_to_disk()
+                print(f">>> [SUCCESS] Limit Entry Posted. Order ID: {cid}")
 
                 threading.Thread(
                     target=wait_for_fill_and_set_sl,
-                    args=(target, side, clean_price, trade_id, clean_qty, ACTIVE_ENTRY_ORDER_ID),
+                    args=(target, side, clean_price, trade_id, clean_qty, cid),
                     daemon=True
                 ).start()
             else:
@@ -443,18 +473,16 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
 
 def update_trailing_stop(symbol: str, quantity: float, sl_price: float, trade_id: int):
-    """Updates trailing stop: places the new tighter stop, then cancels the old one."""
-    global CURRENT_POSITION_SIDE, CURRENT_POSITION_QTY, CURRENT_TRADE_ID, ACTIVE_SL_CLIENT_IDS
+    """Places the new tighter stop loss unconditionally and cancels prior stop upon placement."""
     try:
         target = clean_symbol(symbol)
+        resolved_side = BOT_STATE.get("position_side")
 
-        if CURRENT_POSITION_SIDE is None or CURRENT_TRADE_ID != trade_id:
-            print(f"[REJECTED UPDATE_SL] No confirmed open position for TradeID {trade_id} (Active: {CURRENT_TRADE_ID}, Side: {CURRENT_POSITION_SIDE}). Discarding.")
+        if resolved_side is None or BOT_STATE.get("trade_id") != trade_id:
+            print(f"[REJECTED UPDATE_SL] No open position for TradeID {trade_id} (Active: {BOT_STATE.get('trade_id')}, Side: {resolved_side}). Discarding.")
             return
 
-        resolved_side = CURRENT_POSITION_SIDE
         stop_price = float(f"{sl_price:.2f}")
-
         if stop_price <= 0:
             return
 
@@ -462,24 +490,25 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, trade_id
             clean_qty = float(f"{quantity:.4f}")
             sl_side = "SELL" if resolved_side == "BUY" else "BUY"
 
-            print(f"[UPDATE_SL] Confirmed open position {resolved_side}. Placing new {sl_side} Stop @ {stop_price}...")
+            print(f"[UPDATE_SL] Active position is {resolved_side}. Placing new {sl_side} Stop @ {stop_price}...")
             new_sl_id = place_stop_loss(target, sl_side, clean_qty, stop_price)
 
             if new_sl_id:
-                old_stops = [cid for cid in ACTIVE_SL_CLIENT_IDS if cid != new_sl_id]
+                old_stops = [cid for cid in BOT_STATE.get("active_sl_client_ids", []) if cid != new_sl_id]
                 for old_cid in old_stops:
                     delete_single_order(old_cid)
-                ACTIVE_SL_CLIENT_IDS = [new_sl_id]
+                BOT_STATE["active_sl_client_ids"] = [new_sl_id]
+                save_state_to_disk()
                 print(f">>> [TRAILING SL UPDATED] Active stop is now {new_sl_id} at {stop_price}")
             else:
-                print(f"[UPDATE_SL FAIL] Exchange rejected the new stop order at {stop_price}.")
+                print(f"[UPDATE_SL FAIL] Exchange rejected updated stop at {stop_price}.")
 
     except Exception as e:
         print(f"[TRAILING SL ERROR]: {e}")
 
 
 # =============================================================================
-# FASTAPI ENDPOINTS
+# WEBHOOK ENDPOINTS
 # =============================================================================
 @app.api_route("/", methods=["GET", "HEAD"])
 async def home():
