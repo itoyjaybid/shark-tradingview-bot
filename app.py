@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 import urllib3.util.connection as urllib3_cn
 from fastapi import FastAPI, Request, HTTPException
 
-# Force IPv4 resolution for reliable cloud host routing
+# Force IPv4 routing on cloud hosts
 def allowed_gai_family():
     return socket.AF_INET
 
@@ -74,24 +74,25 @@ def purge_state():
     save_state()
 
 # =============================================================================
-# STRICT MONOTONIC CLOCK SYNCHRONIZATION (Prevents 4007 Nonce/Replay Errors)
+# PRECISION MONOTONIC CLOCK SYNCHRONIZATION
 # =============================================================================
-def time_sync_worker():
+def sync_clock_directly() -> int:
+    """Synchronizes offset directly against Shark Exchange server time."""
     global CLOCK_OFFSET_MS
-    while True:
-        try:
-            r = requests.get(f"{SHARK_BASE_URL}/v1/time", timeout=2)
-            if r.status_code == 200:
-                res = r.json()
-                srv_ts = int(res.get("serverTime") or res.get("data") or 0)
-                if srv_ts > 0:
-                    CLOCK_OFFSET_MS = srv_ts - int(time.time() * 1000)
-        except Exception:
-            pass
-        time.sleep(15)
+    try:
+        r = requests.get(f"{SHARK_BASE_URL}/v1/time", timeout=2)
+        if r.status_code == 200:
+            res = r.json()
+            srv_ts = int(res.get("serverTime") or res.get("data") or 0)
+            if srv_ts > 0:
+                CLOCK_OFFSET_MS = srv_ts - int(time.time() * 1000)
+                return srv_ts
+    except Exception:
+        pass
+    return int(time.time() * 1000) + CLOCK_OFFSET_MS
 
 def get_synced_time() -> int:
-    """Guarantees strictly increasing integer timestamps across rapid order bursts."""
+    """Returns strictly increasing monotonic millisecond timestamps."""
     global LAST_USED_TIMESTAMP, CLOCK_OFFSET_MS
     with TS_LOCK:
         now_ts = int(time.time() * 1000) + CLOCK_OFFSET_MS
@@ -103,24 +104,14 @@ def get_synced_time() -> int:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_state()
-    try:
-        r = requests.get(f"{SHARK_BASE_URL}/v1/time", timeout=2)
-        if r.status_code == 200:
-            res = r.json()
-            srv = int(res.get("serverTime") or res.get("data") or 0)
-            if srv > 0:
-                global CLOCK_OFFSET_MS
-                CLOCK_OFFSET_MS = srv - int(time.time() * 1000)
-                print(f"[CLOCK INITIALIZED] Offset: {CLOCK_OFFSET_MS}ms", flush=True)
-    except Exception:
-        pass
-    threading.Thread(target=time_sync_worker, daemon=True).start()
+    sync_clock_directly()
+    print(f"[BOOT] Server Time Synchronized. Delta: {CLOCK_OFFSET_MS}ms", flush=True)
     yield
 
 app = FastAPI(lifespan=lifespan)
 
 # =============================================================================
-# SIGNING & EXCHANGE HTTP UTILITIES
+# SIGNING & HTTP DISPATCH WITH INSTANT 4007 RESYNC RETRY
 # =============================================================================
 def sign_data(data_str: str) -> dict:
     sig = hmac.new(
@@ -140,45 +131,37 @@ def clean_symbol(sym: str) -> str:
         return DEFAULT_SYMBOL
     return sym.replace("-", "").replace("_", "").replace(".P", "").replace(".p", "").replace("/", "").upper()
 
-def send_signed_order(payload: dict) -> tuple[bool, str]:
-    payload["timestamp"] = get_synced_time()
-    body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-    headers = sign_data(body)
+def send_signed_order(payload: dict, max_retries: int = 3) -> tuple[bool, str]:
+    """Posts signed order payload with automatic 4007 resync and retry."""
+    for attempt in range(max_retries):
+        if attempt > 0:
+            sync_clock_directly()
+            time.sleep(0.08)
 
-    try:
-        r = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=body, headers=headers, timeout=3)
-        if r.status_code in [200, 201]:
-            res = r.json()
-            cid = res.get("clientOrderId") or res.get("data", {}).get("clientOrderId")
-            return True, cid
+        payload["timestamp"] = get_synced_time()
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        headers = sign_data(body)
 
-        # Resync and retry on signature drift
-        if r.status_code == 403 or "Signature mismatch" in r.text:
-            time.sleep(0.05)
-            try:
-                srv_r = requests.get(f"{SHARK_BASE_URL}/v1/time", timeout=2)
-                if srv_r.status_code == 200:
-                    srv_val = int(srv_r.json().get("serverTime") or srv_r.json().get("data") or 0)
-                    if srv_val > 0:
-                        global CLOCK_OFFSET_MS
-                        CLOCK_OFFSET_MS = srv_val - int(time.time() * 1000)
-            except Exception:
-                pass
-
-            payload["timestamp"] = get_synced_time()
-            body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-            headers = sign_data(body)
+        try:
             r = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=body, headers=headers, timeout=3)
+            
             if r.status_code in [200, 201]:
                 res = r.json()
                 cid = res.get("clientOrderId") or res.get("data", {}).get("clientOrderId")
                 return True, cid
 
-        print(f"[EXCHANGE REJECTED] HTTP {r.status_code}: {r.text}", flush=True)
-        return False, None
-    except Exception as e:
-        print(f"[DISPATCH ERROR]: {e}", flush=True)
-        return False, None
+            if r.status_code == 403 or "4007" in r.text or "Signature mismatch" in r.text:
+                print(f"[SIGNATURE RETRY] Attempt {attempt + 1} hit 4007. Resyncing clock...", flush=True)
+                continue
+
+            print(f"[EXCHANGE REJECTED] HTTP {r.status_code}: {r.text}", flush=True)
+            return False, None
+
+        except Exception as e:
+            print(f"[DISPATCH ERROR]: {e}", flush=True)
+            time.sleep(0.08)
+
+    return False, None
 
 def cancel_order(client_order_id: str) -> bool:
     if not client_order_id:
@@ -195,11 +178,10 @@ def cancel_order(client_order_id: str) -> bool:
         return False
 
 # =============================================================================
-# CONDITION 13: REAL EXCHANGE POSITION AUDIT
+# POSITION AUDIT & REAL-TIME TICKER
 # =============================================================================
 def get_exchange_position_state(symbol: str) -> tuple[float, str]:
-    """Queries Shark Exchange to confirm if a position is truly open.
-    Returns: (position_qty, 'BUY' | 'SELL' | 'FLAT')"""
+    """Authoritatively queries exchange open positions. Returns: (qty, 'BUY' | 'SELL' | 'FLAT')"""
     target = clean_symbol(symbol)
     ts = str(get_synced_time())
     
@@ -251,11 +233,9 @@ def get_current_ticker_price(symbol: str) -> float:
     return 0.0
 
 # =============================================================================
-# CONDITION 3: SLIPPAGE BUFFER DETECTOR & MARKET FALLBACK ENGINE
+# FLASH CRASH & SLIPPAGE SWEEPER (Condition 3)
 # =============================================================================
 def monitor_slippage_and_spike_fallback(symbol: str, sl_client_id: str, limit_price: float, side: str, qty: float, trade_id: int):
-    """Watches live market prices. If a sudden spike gaps past the 15 pt buffer without
-    filling the Stop Limit order, it cancels the stop and executes a reduceOnly MARKET exit."""
     target = clean_symbol(symbol)
     is_buy_back = side == "BUY"
 
@@ -268,10 +248,10 @@ def monitor_slippage_and_spike_fallback(symbol: str, sl_client_id: str, limit_pr
 
         gapped = (is_buy_back and curr_price > limit_price) or ((not is_buy_back) and curr_price < limit_price)
         if gapped:
-            print(f"\n[SPIKE DETECTED] Market price ({curr_price}) breached limit buffer ({limit_price})!", flush=True)
+            print(f"\n[SPIKE DETECTED] Price ({curr_price}) breached limit buffer ({limit_price})!", flush=True)
             with ENGINE_LOCK:
                 if BOT_STATE.get("sl_id") == sl_client_id:
-                    print("[EMERGENCY FALLBACK] Sweeping execution via MARKET order...", flush=True)
+                    print("[EMERGENCY FALLBACK] Liquidating via MARKET order...", flush=True)
                     cancel_order(sl_client_id)
                     flatten_position(target, side, qty)
                     purge_state()
@@ -284,31 +264,28 @@ def place_stop_loss(symbol: str, side: str, qty: float, stop_price: float, trade
     target = clean_symbol(symbol)
     offset = 15.0
     limit_price = round(stop_price - offset, 2) if side == "SELL" else round(stop_price + offset, 2)
-    clean_stop = float(f"{stop_price:.2f}")
-    clean_limit = float(f"{limit_price:.2f}")
-    clean_qty = float(f"{qty:.4f}")
-
+    
     payload = {
         "deviceType": "WEB",
         "marginAsset": "INR",
         "placeType": "ORDER_FORM",
-        "price": clean_limit,
-        "quantity": clean_qty,
+        "price": float(f"{limit_price:.2f}"),
+        "quantity": float(f"{qty:.4f}"),
         "reduceOnly": True,
         "side": side,
-        "stopPrice": clean_stop,
+        "stopPrice": float(f"{stop_price:.2f}"),
         "symbol": target,
         "type": "STOP_LIMIT",
         "userCategory": "EXTERNAL"
     }
 
-    print(f"[STOP PLACE] Submitting {side} Stop @ {clean_stop} (Limit Buffer: {clean_limit})...", flush=True)
+    print(f"[STOP PLACE] Submitting {side} Stop @ {payload['stopPrice']} (Limit: {payload['price']})...", flush=True)
     ok, cid = send_signed_order(payload)
     if ok and cid:
         print(f">>> [STOP PLACED] Order ID: {cid}", flush=True)
         threading.Thread(
             target=monitor_slippage_and_spike_fallback,
-            args=(target, cid, clean_limit, side, clean_qty, trade_id),
+            args=(target, cid, payload["price"], side, payload["quantity"], trade_id),
             daemon=True
         ).start()
         return cid
@@ -327,35 +304,43 @@ def flatten_position(symbol: str, side: str, qty: float):
         "type": "MARKET",
         "userCategory": "EXTERNAL"
     }
-    print(f"[REVERSAL FLATTEN] Liquidating {side} {qty}...", flush=True)
+    print(f"[FLATTEN] Liquidating {side} {qty}...", flush=True)
     send_signed_order(payload)
 
 # =============================================================================
-# AUTHENTIC ENTRY FILL WATCHER (STRICT VALIDATION)
+# DUAL-LAYER ENTRY FILL WATCHER (ROBUST VALIDATION)
 # =============================================================================
-def check_fill_status(client_order_id: str, symbol: str) -> tuple[bool, float]:
-    """Authoritative check: only returns True when exchange confirms executed quantity or status."""
+def check_fill_status(client_order_id: str, symbol: str, target_side: str, target_qty: float) -> tuple[bool, float]:
     target = clean_symbol(symbol)
     ts = str(get_synced_time())
     query = f"clientOrderId={client_order_id}&symbol={target}&timestamp={ts}"
     headers = sign_data(query)
 
+    # 1. Primary Check: Query order detail
     try:
         r = requests.get(f"{SHARK_BASE_URL}/v1/order/order-detail?{query}", headers=headers, timeout=2)
         if r.status_code == 200:
             res_json = r.json()
             order = res_json.get("data", res_json)
             if isinstance(order, dict):
-                st = str(order.get("status") or "").upper()
+                if "order" in order and isinstance(order["order"], dict):
+                    order = order["order"]
+                st = str(order.get("status") or order.get("orderStatus") or order.get("state") or "").upper()
                 exec_qty = float(order.get("executedQty") or order.get("cumQty") or order.get("filledQty") or 0.0)
                 p = float(order.get("avgPrice") or order.get("executedPrice") or order.get("price") or 0.0)
 
-                if st in ["FILLED", "SUCCESS", "EXECUTED"] or exec_qty > 0.0:
+                if st in ["FILLED", "SUCCESS", "EXECUTED", "COMPLETE", "CLOSED"] or exec_qty > 0.0:
                     return True, p
                 if st in ["CANCELED", "CANCELLED", "REJECTED", "EXPIRED"]:
                     return False, -1.0
     except Exception:
         pass
+
+    # 2. Dual-Layer Fallback: Verify if position exists live on exchange
+    live_qty, live_side = get_exchange_position_state(target)
+    if live_qty >= (target_qty * 0.90) and live_side == target_side:
+        print(f">>> [FALLBACK DETECTED] Verified position is active on Shark ({live_side} {live_qty})!", flush=True)
+        return True, 0.0
 
     return False, 0.0
 
@@ -374,14 +359,14 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
             print(f"[WATCHER] Trade {trade_id} superseded. Exiting.", flush=True)
             return
 
-        filled, exec_p = check_fill_status(order_id, target)
+        filled, exec_p = check_fill_status(order_id, target, side, qty)
         if exec_p == -1.0:
-            print(f"[WATCHER] Order {order_id} canceled or rejected by exchange. Exiting.", flush=True)
+            print(f"[WATCHER] Order {order_id} canceled or rejected by exchange.", flush=True)
             return
 
         if filled:
             real_fill = exec_p if exec_p > 0 else limit_price
-            print(f">>> [FILL CONFIRMED] Limit order filled @ {real_fill}", flush=True)
+            print(f">>> [FILL CONFIRMED] Entry executed @ {real_fill}", flush=True)
 
             with ENGINE_LOCK:
                 BOT_STATE["side"] = side
@@ -390,7 +375,7 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
                 BOT_STATE["entry_id"] = None
                 save_state()
 
-                # Condition 14: Set 100 pt stop relative to verified fill price
+                # Condition 14: Stop placed exactly 100 pts away from verified fill price
                 initial_stop = round(real_fill - 100.0, 2) if side == "BUY" else round(real_fill + 100.0, 2)
                 sl_id = place_stop_loss(target, sl_side, qty, initial_stop, trade_id)
                 if sl_id:
@@ -399,7 +384,7 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
                     save_state()
             return
 
-    print(f"[WATCHER TIMEOUT] Order {order_id} unfilled. Canceling...", flush=True)
+    print(f"[WATCHER TIMEOUT] Order {order_id} unfilled after {timeout_sec}s. Canceling...", flush=True)
     with ENGINE_LOCK:
         cancel_order(order_id)
         if BOT_STATE.get("entry_id") == order_id:
@@ -414,16 +399,16 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
         target = clean_symbol(symbol)
         side = "BUY" if "BUY" in action else "SELL"
 
-        # Condition 13: Audit exchange position before taking new trade
+        # Condition 13: Liquidate opposing position if open
         live_qty, live_side = get_exchange_position_state(target)
         if live_qty > 0.0 and live_side != side:
-            print(f"[CONDITION 13 CHECK] Existing {live_side} position ({live_qty}) detected. Liquidating...", flush=True)
+            print(f"[REVERSAL DETECTED] Closing {live_side} position ({live_qty})...", flush=True)
             if BOT_STATE.get("sl_id"):
                 cancel_order(BOT_STATE["sl_id"])
             flatten_position(target, "SELL" if live_side == "BUY" else "BUY", live_qty)
-            time.sleep(0.1)  # Buffer prevents timestamp collisions on immediate entry submission
+            time.sleep(0.12)
 
-        # Clear active entry and stop
+        # Clear prior resting orders
         if BOT_STATE.get("entry_id"):
             cancel_order(BOT_STATE["entry_id"])
             BOT_STATE["entry_id"] = None
@@ -472,17 +457,17 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
     with ENGINE_LOCK:
         target = clean_symbol(symbol)
 
-        # Condition 13: Ensure position exists on exchange before modifying stop loss
+        # Condition 13: Must verify position exists on exchange
         live_qty, live_side = get_exchange_position_state(target)
         if live_qty <= 0.0:
-            print(f"[CONDITION 13 TRIGGERED] No active position on exchange. Discarding UPDATE_SL and clearing stops.", flush=True)
+            print(f"[UPDATE_SL DISCARDED] Position is flat on exchange. Purging state.", flush=True)
             if BOT_STATE.get("sl_id"):
                 cancel_order(BOT_STATE["sl_id"])
             purge_state()
             return
 
         if BOT_STATE.get("trade_id") != trade_id:
-            print(f"[UPDATE_SL IGNORED] TradeID {trade_id} mismatch. Discarding.", flush=True)
+            print(f"[UPDATE_SL IGNORED] Trade ID mismatch ({trade_id} != {BOT_STATE.get('trade_id')}).", flush=True)
             return
 
         new_stop = float(f"{sl_price:.2f}")
@@ -496,7 +481,6 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
 
         print(f"[UPDATE_SL] Moving {sl_side} Stop from {old_sl_price} to {new_stop}...", flush=True)
 
-        # Cancel old stop first to adhere to reduceOnly limits
         if old_sl_id:
             cancel_order(old_sl_id)
             BOT_STATE["sl_id"] = None
@@ -507,18 +491,17 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
             BOT_STATE["sl_id"] = new_sl_id
             BOT_STATE["sl_price"] = new_stop
             save_state()
-            print(f">>> [TRAILING SL SUCCESS] Stop moved to {new_stop} | ID: {new_sl_id}", flush=True)
+            print(f">>> [STOP UPDATED] Moved to {new_stop} | ID: {new_sl_id}", flush=True)
         else:
-            # Fallback restore if new stop is rejected
             if old_sl_price > 0:
-                print(f"[UPDATE_SL REJECTED] Restoring original stop @ {old_sl_price}...", flush=True)
+                print(f"[STOP RESTORE] Re-posting previous stop @ {old_sl_price}...", flush=True)
                 restored_id = place_stop_loss(target, sl_side, live_qty, old_sl_price, trade_id)
                 if restored_id:
                     BOT_STATE["sl_id"] = restored_id
                     save_state()
 
 # =============================================================================
-# WEBHOOK ENDPOINTS
+# WEBHOOK RECEIVER
 # =============================================================================
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
@@ -540,12 +523,12 @@ async def receive_webhook(request: Request):
     price = float(data.get("price", 0.0))
     sl_price = float(data.get("sl_price", 0.0))
     trade_id = int(data.get("trade_id", 0))
-    timeout_sec = int(data.get("timeout_sec", 600))
+    timeout_sec = int(data.get("timeout_sec", 1200))
 
     if action == "UPDATE_SL" and sl_price == 0.0 and price > 0.0:
         sl_price = price
 
-    print(f"\n[ALERT] Action: {action} | TradeID: {trade_id} | Qty: {qty} | Price: {price} | SL: {sl_price}", flush=True)
+    print(f"\n[ALERT RECEIVED] Action: {action} | TradeID: {trade_id} | Qty: {qty} | Price: {price} | SL: {sl_price}", flush=True)
 
     if action in ["BUY", "SELL", "REVERSE_BUY", "REVERSE_SELL"]:
         threading.Thread(
