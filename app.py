@@ -66,7 +66,6 @@ def get_synced_timestamp() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Runs on startup
     sync_exchange_time()
     yield
 
@@ -118,10 +117,7 @@ def get_current_market_price(symbol: str = DEFAULT_SYMBOL) -> float:
 
 
 def check_order_status(client_order_id: str, symbol: str = DEFAULT_SYMBOL) -> tuple[str, float]:
-    """
-    Checks exact status of an order via order-detail.
-    Returns: (status: str, executed_price: float)
-    """
+    """Checks exact status of an order via order-detail."""
     target = clean_symbol(symbol)
     ts = get_synced_timestamp()
     variants = [target, f"{target[:-4]}-{target[-4:]}"]
@@ -231,10 +227,7 @@ def emergency_market_close(symbol: str, side: str, quantity: float):
 
 
 def liquidate_prior_position_if_any(symbol: str):
-    """
-    Condition 7 & 13: Closes prior position immediately upon reversal alert.
-    Relies on authoritative state tracking so it executes without relying on delayed exchange queries.
-    """
+    """Closes prior position immediately upon reversal alert based on authoritative state."""
     global CURRENT_POSITION_SIDE, CURRENT_POSITION_QTY
     if CURRENT_POSITION_SIDE in ["BUY", "SELL"] and CURRENT_POSITION_QTY > 0:
         close_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
@@ -248,7 +241,7 @@ def liquidate_prior_position_if_any(symbol: str):
 
 
 def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, limit_price: float, sl_client_id: str, trade_id: int):
-    """Condition 3: Watchdog thread to sweep market close if price gaps past stop limit."""
+    """Watchdog thread to sweep market close if price gaps past stop limit."""
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, CURRENT_POSITION_QTY
     is_buying_back = side == "BUY"
     target = clean_symbol(symbol)
@@ -275,7 +268,7 @@ def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, l
 
 
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0) -> str:
-    """Condition 3: Submits STOP_LIMIT order with 15 pt limit buffer using fresh synced timestamp."""
+    """Submits STOP_LIMIT order with 15 pt limit buffer using fresh synced timestamp."""
     global ACTIVE_SL_CLIENT_IDS, CURRENT_TRADE_ID
     try:
         sync_exchange_time()
@@ -347,10 +340,7 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
 
 def wait_for_fill_and_set_sl(symbol: str, target_side: str, entry_price: float, trade_id: int, quantity: float, order_id: str):
-    """
-    Watches entry order fill via order-detail and order book verification.
-    Sets stop loss immediately once the order executes.
-    """
+    """Watches entry order fill and sets stop loss immediately once executed."""
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, CURRENT_POSITION_QTY, ACTIVE_ENTRY_ORDER_ID, ACTIVE_SL_CLIENT_IDS
     target = clean_symbol(symbol)
     is_buy = target_side == "BUY"
@@ -369,7 +359,6 @@ def wait_for_fill_and_set_sl(symbol: str, target_side: str, entry_price: float, 
         status, exec_price = check_order_status(order_id, target)
         is_open = is_order_in_open_book(order_id, target)
 
-        # Fill confirmed
         if status in ["FILLED", "SUCCESS", "EXECUTED"] or (not is_open and status != "CANCELED"):
             print(f">>> [REAL EXECUTION CONFIRMED] Limit order {order_id} filled!")
             CURRENT_POSITION_SIDE = target_side
@@ -457,15 +446,17 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
 
 def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_price: float, trade_id: int, fallback_side: str = None):
-    """Updates trailing stop cleanly based on authoritative in-memory state."""
+    """Updates trailing stop only if the trade is genuinely open in bot state."""
     global CURRENT_POSITION_SIDE, CURRENT_POSITION_QTY, CURRENT_TRADE_ID, ACTIVE_SL_CLIENT_IDS
     try:
         target = clean_symbol(symbol)
-        resolved_side = CURRENT_POSITION_SIDE or fallback_side
 
-        if resolved_side not in ["BUY", "SELL"]:
-            print(f"[REJECTED UPDATE_SL] No active position tracked in bot. Discarding trailing SL.")
+        # STRICT GUARD: Only trail if the bot has an active, filled position for THIS exact trade
+        if CURRENT_POSITION_SIDE is None or CURRENT_TRADE_ID != trade_id:
+            print(f"[REJECTED UPDATE_SL] No confirmed open position for TradeID {trade_id} (Active: {CURRENT_TRADE_ID}, Side: {CURRENT_POSITION_SIDE}). Discarding.")
             return
+
+        resolved_side = CURRENT_POSITION_SIDE
 
         stop_price = float(f"{sl_price:.2f}")
         ref_price = float(f"{current_price:.2f}") if current_price else 0.0
@@ -474,7 +465,6 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
             return
 
         with ORDER_EXECUTION_LOCK:
-            CURRENT_TRADE_ID = trade_id
             clean_qty = float(f"{quantity:.4f}")
             sl_side = "SELL" if resolved_side == "BUY" else "BUY"
 
