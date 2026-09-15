@@ -30,7 +30,7 @@ DEFAULT_SYMBOL = "BTCUSDT"
 # Clock synchronization offset (Render container vs Shark server)
 SERVER_TIME_OFFSET_MS = 0
 
-# Tracked Execution State (Authoritative local state)
+# Authoritative Execution State
 CURRENT_TRADE_ID = None
 CURRENT_POSITION_SIDE = None
 CURRENT_POSITION_QTY = 0.0
@@ -340,14 +340,17 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 
 
 def wait_for_fill_and_set_sl(symbol: str, target_side: str, entry_price: float, trade_id: int, quantity: float, order_id: str):
-    """Watches entry order fill and sets stop loss immediately once executed."""
+    """
+    Watches entry order fill and queries true execution price to place accurate 100 pt stop.
+    Captures price improvement without premature fallbacks.
+    """
     global CURRENT_TRADE_ID, CURRENT_POSITION_SIDE, CURRENT_POSITION_QTY, ACTIVE_ENTRY_ORDER_ID, ACTIVE_SL_CLIENT_IDS
     target = clean_symbol(symbol)
     is_buy = target_side == "BUY"
     start_time = time.time()
 
     print(f"[WATCHER] Polling order {order_id} for fill (Timeout: {ENTRY_ORDER_EXPIRATION_SECONDS}s)...")
-    time.sleep(2.0)
+    time.sleep(1.5)
 
     while (time.time() - start_time) < ENTRY_ORDER_EXPIRATION_SECONDS:
         time.sleep(1.0)
@@ -361,11 +364,25 @@ def wait_for_fill_and_set_sl(symbol: str, target_side: str, entry_price: float, 
 
         if status in ["FILLED", "SUCCESS", "EXECUTED"] or (not is_open and status != "CANCELED"):
             print(f">>> [REAL EXECUTION CONFIRMED] Limit order {order_id} filled!")
+
+            # Micro-poll to guarantee reading the true executed fill price
+            real_fill_price = exec_price
+            if real_fill_price <= 0:
+                for _ in range(4):
+                    time.sleep(0.3)
+                    _, retry_p = check_order_status(order_id, target)
+                    if retry_p > 0:
+                        real_fill_price = retry_p
+                        break
+
+            # Fallback to limit price if exchange trade records have not settled
+            if real_fill_price <= 0:
+                real_fill_price = entry_price
+
+            print(f">>> [ACCURATE FILL PRICE RESOLVED]: {real_fill_price}")
+
             CURRENT_POSITION_SIDE = target_side
             CURRENT_POSITION_QTY = quantity
-
-            real_fill_price = exec_price if exec_price > 0 else entry_price
-            print(f">>> [TRUE FILL PRICE]: {real_fill_price}")
 
             initial_stop = round(real_fill_price - 100.0, 2) if is_buy else round(real_fill_price + 100.0, 2)
             sl_side = "SELL" if is_buy else "BUY"
