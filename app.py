@@ -10,14 +10,14 @@ from contextlib import asynccontextmanager
 import urllib3.util.connection as urllib3_cn
 from fastapi import FastAPI, Request, HTTPException
 
-# Force IPv4 resolution for reliable cloud host routing
+# Force IPv4 resolution
 def allowed_gai_family():
     return socket.AF_INET
 
 urllib3_cn.allowed_gai_family = allowed_gai_family
 
 # =============================================================================
-# ENVIRONMENT VARIABLES & CONFIGURATION
+# ENVIRONMENT & CONFIGURATION
 # =============================================================================
 SHARK_BASE_URL = "https://api.sharkexchange.in"
 SHARK_API_KEY = os.getenv("SHARK_API_KEY", "").strip().strip("'").strip('"')
@@ -29,9 +29,10 @@ DEFAULT_SYMBOL = "BTCUSDT"
 STATE_FILE_PATH = "state.json"
 
 SERVER_TIME_OFFSET_MS = 0
+LAST_TIME_SYNC = 0
+
 ORDER_EXECUTION_LOCK = threading.Lock()
 
-# Persistent state schema template
 BOT_STATE = {
     "trade_id": None,
     "position_side": None,
@@ -42,23 +43,20 @@ BOT_STATE = {
 
 
 # =============================================================================
-# STATE PERSISTENCE (Survives Render Container Restarts / Freezes)
+# PERSISTENT STORAGE
 # =============================================================================
 def load_state_from_disk():
-    """Restores bot trade memory across container recycles."""
     global BOT_STATE
     if os.path.exists(STATE_FILE_PATH):
         try:
             with open(STATE_FILE_PATH, "r") as f:
-                loaded = json.load(f)
-                BOT_STATE.update(loaded)
+                BOT_STATE.update(json.load(f))
                 print(f"[STATE LOADED] TradeID: {BOT_STATE['trade_id']} | Side: {BOT_STATE['position_side']} | Qty: {BOT_STATE['position_qty']}")
         except Exception as e:
             print(f"[STATE LOAD ERROR]: {e}")
 
 
 def save_state_to_disk():
-    """Flushes active state to persistent file storage immediately."""
     try:
         with open(STATE_FILE_PATH, "w") as f:
             json.dump(BOT_STATE, f, indent=2)
@@ -67,35 +65,38 @@ def save_state_to_disk():
 
 
 # =============================================================================
-# TIME SYNCHRONIZATION & AUTHENTICATION
+# DYNAMIC TIME SYNCHRONIZATION & SIGNING
 # =============================================================================
-def sync_exchange_time():
-    """Calculates clock drift to eliminate 4007 Signature Mismatches."""
-    global SERVER_TIME_OFFSET_MS
+def sync_exchange_time(force: bool = False):
+    """Refreshes exchange clock offset periodically to prevent drift over time."""
+    global SERVER_TIME_OFFSET_MS, LAST_TIME_SYNC
+    now = time.time()
+    if not force and (now - LAST_TIME_SYNC) < 60:
+        return
+
     try:
-        resp = requests.get(f"{SHARK_BASE_URL}/v1/time", timeout=3)
+        resp = requests.get(f"{SHARK_BASE_URL}/v1/time", timeout=2)
         if resp.status_code == 200:
             res_data = resp.json()
             server_ts = int(res_data.get("serverTime") or res_data.get("data") or 0)
             if server_ts > 0:
                 local_ts = int(time.time() * 1000)
-                diff = server_ts - local_ts
-                if abs(diff) < 60000:
-                    SERVER_TIME_OFFSET_MS = diff
-                    print(f"[TIME SYNC] Offset aligned: {SERVER_TIME_OFFSET_MS}ms")
+                SERVER_TIME_OFFSET_MS = server_ts - local_ts
+                LAST_TIME_SYNC = now
+                print(f"[TIME SYNC] Offset refreshed: {SERVER_TIME_OFFSET_MS}ms")
     except Exception as e:
-        print(f"[TIME SYNC WARN]: {e}")
+        print(f"[TIME SYNC ERROR]: {e}")
 
 
 def get_current_ts_int() -> int:
-    """Returns local epoch milliseconds adjusted by exchange drift as a raw INT."""
+    sync_exchange_time()
     return int(time.time() * 1000) + SERVER_TIME_OFFSET_MS
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_state_from_disk()
-    sync_exchange_time()
+    sync_exchange_time(force=True)
     yield
 
 
@@ -103,7 +104,6 @@ app = FastAPI(lifespan=lifespan)
 
 
 def get_headers(payload_or_querystr: str) -> dict:
-    """Generates Shark HMAC-SHA256 authenticated headers."""
     sig = hmac.new(
         SHARK_API_SECRET.encode("utf-8"),
         payload_or_querystr.encode("utf-8"),
@@ -124,7 +124,40 @@ def clean_symbol(sym: str) -> str:
 
 
 # =============================================================================
-# EXCHANGE DATA LOOKUPS & ORDER CHECKS
+# ORDER POSTING WITH AUTOMATIC RE-SYNC RETRY
+# =============================================================================
+def send_signed_order_request(params: dict) -> requests.Response:
+    """Submits order and automatically resyncs clock + retries if signature mismatch occurs."""
+    params["timestamp"] = get_current_ts_int()
+    body = json.dumps(params, separators=(",", ":"), sort_keys=True)
+    headers = get_headers(body)
+
+    resp = requests.post(
+        f"{SHARK_BASE_URL}/v1/order/place-order",
+        data=body.encode("utf-8"),
+        headers=headers,
+        timeout=3
+    )
+
+    # If rejected due to timestamp/signature drift, immediately force resync and retry
+    if resp.status_code == 403 or "Signature mismatch" in resp.text:
+        print("[AUTO-RESYNC] 403 Signature Mismatch detected. Forcing clock resync and retrying...")
+        sync_exchange_time(force=True)
+        params["timestamp"] = get_current_ts_int()
+        body = json.dumps(params, separators=(",", ":"), sort_keys=True)
+        headers = get_headers(body)
+        resp = requests.post(
+            f"{SHARK_BASE_URL}/v1/order/place-order",
+            data=body.encode("utf-8"),
+            headers=headers,
+            timeout=3
+        )
+
+    return resp
+
+
+# =============================================================================
+# EXCHANGE DATA LOOKUPS
 # =============================================================================
 def get_current_market_price(symbol: str = DEFAULT_SYMBOL) -> float:
     target = clean_symbol(symbol)
@@ -146,7 +179,6 @@ def get_current_market_price(symbol: str = DEFAULT_SYMBOL) -> float:
 
 
 def check_order_status(client_order_id: str, symbol: str = DEFAULT_SYMBOL) -> tuple[str, float]:
-    """Retrieves authoritative execution status and average executed fill price."""
     target = clean_symbol(symbol)
     ts = str(get_current_ts_int())
     for sym in [target, f"{target[:-4]}-{target[-4:]}"]:
@@ -168,7 +200,6 @@ def check_order_status(client_order_id: str, symbol: str = DEFAULT_SYMBOL) -> tu
 
 
 def is_order_in_open_book(client_order_id: str, symbol: str = DEFAULT_SYMBOL) -> bool:
-    """Verifies whether an order is actively resting on the order book."""
     target = clean_symbol(symbol)
     ts = str(get_current_ts_int())
     for sym in [target, f"{target[:-4]}-{target[-4:]}"]:
@@ -190,7 +221,6 @@ def is_order_in_open_book(client_order_id: str, symbol: str = DEFAULT_SYMBOL) ->
 
 
 def delete_single_order(client_order_id: str) -> bool:
-    """Deletes order using pure minimal JSON schema (int timestamp, no symbol)."""
     payload = {
         "clientOrderId": str(client_order_id),
         "timestamp": get_current_ts_int()
@@ -212,7 +242,6 @@ def delete_single_order(client_order_id: str) -> bool:
 
 
 def cancel_all_tracked_stops():
-    """Purges all tracked stop losses on exchange and clears state."""
     sl_ids = list(BOT_STATE.get("active_sl_client_ids", []))
     for cid in sl_ids:
         delete_single_order(cid)
@@ -221,7 +250,6 @@ def cancel_all_tracked_stops():
 
 
 def cancel_pending_limit_entry():
-    """Cancels any active resting limit entry order."""
     entry_id = BOT_STATE.get("active_entry_order_id")
     if entry_id:
         print(f"[ENTRY CLEANUP] Canceling limit entry: {entry_id}")
@@ -231,7 +259,6 @@ def cancel_pending_limit_entry():
 
 
 def emergency_market_close(symbol: str, side: str, quantity: float):
-    """Executes an immediate reduceOnly MARKET order."""
     target = clean_symbol(symbol)
     close_params = {
         "deviceType": "WEB",
@@ -241,21 +268,17 @@ def emergency_market_close(symbol: str, side: str, quantity: float):
         "reduceOnly": True,
         "side": side,
         "symbol": target,
-        "timestamp": get_current_ts_int(),
         "type": "MARKET",
         "userCategory": "EXTERNAL"
     }
     try:
-        body = json.dumps(close_params, separators=(",", ":"), sort_keys=True)
-        headers = get_headers(body)
-        resp = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=body.encode("utf-8"), headers=headers, timeout=3)
+        resp = send_signed_order_request(close_params)
         print(f">>> [MARKET FLATTEN RESULT HTTP {resp.status_code}]: {resp.text.strip()}")
     except Exception as e:
         print(f"[EMERGENCY CLOSE ERROR]: {e}")
 
 
 def liquidate_prior_position_if_any(symbol: str):
-    """Guarantees full market liquidation of prior trades before opening new positions."""
     side = BOT_STATE.get("position_side")
     qty = BOT_STATE.get("position_qty", 0.0)
 
@@ -272,7 +295,6 @@ def liquidate_prior_position_if_any(symbol: str):
 
 
 def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, limit_price: float, sl_client_id: str, trade_id: int):
-    """Sweeps execution via market close if stop price is breached with zero fills."""
     is_buying_back = side == "BUY"
     target = clean_symbol(symbol)
 
@@ -297,7 +319,6 @@ def monitor_slippage_and_market_close(symbol: str, side: str, quantity: float, l
 
 
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float) -> str:
-    """Submits a STOP_LIMIT order with a 15-point limit buffer directly to Shark."""
     try:
         target = clean_symbol(symbol)
         offset = 15.0
@@ -316,21 +337,12 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float) 
             "side": side,
             "stopPrice": clean_stop,
             "symbol": target,
-            "timestamp": get_current_ts_int(),
             "type": "STOP_LIMIT",
             "userCategory": "EXTERNAL"
         }
 
-        sl_body = json.dumps(sl_params, separators=(",", ":"), sort_keys=True)
-        sl_headers = get_headers(sl_body)
-
         print(f"[SL SUBMIT] Placing {side} STOP_LIMIT @ Stop: {clean_stop}, Limit: {clean_limit}...")
-        resp = requests.post(
-            f"{SHARK_BASE_URL}/v1/order/place-order",
-            data=sl_body.encode("utf-8"),
-            headers=sl_headers,
-            timeout=3
-        )
+        resp = send_signed_order_request(sl_params)
 
         if resp.status_code in [200, 201]:
             res = resp.json()
@@ -352,7 +364,6 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float) 
 
 
 def wait_for_fill_and_set_sl(symbol: str, target_side: str, entry_price: float, trade_id: int, quantity: float, order_id: str):
-    """Monitors fill and sets protective 100 pt stop based strictly on the accurate fill price."""
     target = clean_symbol(symbol)
     is_buy = target_side == "BUY"
     start_time = time.time()
@@ -373,7 +384,6 @@ def wait_for_fill_and_set_sl(symbol: str, target_side: str, entry_price: float, 
         if status in ["FILLED", "SUCCESS", "EXECUTED"] or (not is_open and status != "CANCELED"):
             print(f">>> [REAL EXECUTION CONFIRMED] Limit order {order_id} filled!")
 
-            # Micro-poll loop captures true executed price including positive price improvements
             real_fill_price = exec_price
             if real_fill_price <= 0:
                 for _ in range(4):
@@ -408,7 +418,6 @@ def wait_for_fill_and_set_sl(symbol: str, target_side: str, entry_price: float, 
 
 
 def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_price: float, trade_id: int):
-    """Executes clean reversal, synchronization, and entry order placement."""
     with ORDER_EXECUTION_LOCK:
         try:
             target = clean_symbol(symbol)
@@ -427,7 +436,6 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
             BOT_STATE["trade_id"] = trade_id
             save_state_to_disk()
 
-            ts_int = get_current_ts_int()
             entry_params = {
                 "deviceType": "WEB",
                 "marginAsset": "INR",
@@ -437,21 +445,12 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
                 "reduceOnly": False,
                 "side": side,
                 "symbol": target,
-                "timestamp": ts_int,
                 "type": "LIMIT",
                 "userCategory": "EXTERNAL"
             }
 
-            entry_body = json.dumps(entry_params, separators=(",", ":"), sort_keys=True)
-            entry_headers = get_headers(entry_body)
-
-            print(f"\n[LIMIT ENTRY] Placing {side} {clean_qty} ({target}) @ Limit Price {clean_price} (ts: {ts_int})...")
-            resp_entry = requests.post(
-                f"{SHARK_BASE_URL}/v1/order/place-order",
-                data=entry_body.encode("utf-8"),
-                headers=entry_headers,
-                timeout=3
-            )
+            print(f"\n[LIMIT ENTRY] Placing {side} {clean_qty} ({target}) @ Limit Price {clean_price}...")
+            resp_entry = send_signed_order_request(entry_params)
 
             if resp_entry.status_code in [200, 201]:
                 res_data = resp_entry.json()
@@ -473,7 +472,6 @@ def execute_entry_order(action: str, symbol: str, quantity: float, target_limit_
 
 
 def update_trailing_stop(symbol: str, quantity: float, sl_price: float, trade_id: int):
-    """Places the new tighter stop loss unconditionally and cancels prior stop upon placement."""
     try:
         target = clean_symbol(symbol)
         resolved_side = BOT_STATE.get("position_side")
