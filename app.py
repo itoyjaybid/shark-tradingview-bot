@@ -110,7 +110,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # =============================================================================
-# SIGNING & HTTP DISPATCH WITH 4007 RESYNC RETRY
+# SIGNING & HTTP DISPATCH WITH 4007 AUTO-RETRY
 # =============================================================================
 def sign_data(data_str: str) -> dict:
     sig = hmac.new(
@@ -297,11 +297,11 @@ def flatten_position(symbol: str, side: str, qty: float):
         "type": "MARKET",
         "userCategory": "EXTERNAL"
     }
-    print(f"[FLATTEN] Liquidating {side} {qty}...", flush=True)
+    print(f"[IMMEDIATE EXIT] Market liquidation {side} {qty}...", flush=True)
     send_signed_order(payload)
 
 # =============================================================================
-# RIGOROUS ENTRY FILL WATCHER
+# ENTRY FILL WATCHER
 # =============================================================================
 def check_fill_status(client_order_id: str, symbol: str) -> tuple[bool, float]:
     target = clean_symbol(symbol)
@@ -361,7 +361,7 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
                 BOT_STATE["entry_id"] = None
                 save_state()
 
-                # Place Stop Loss 100 pts away from verified fill price
+                # Condition 14: Place Stop Loss 100 pts away from verified fill price
                 initial_stop = round(real_fill - 100.0, 2) if side == "BUY" else round(real_fill + 100.0, 2)
                 sl_id = place_stop_loss(target, sl_side, qty, initial_stop, trade_id)
                 if sl_id:
@@ -378,7 +378,7 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
             save_state()
 
 # =============================================================================
-# WORKFLOW EXECUTION
+# DISPATCH & REVERSAL WORKFLOW
 # =============================================================================
 def process_entry_signal(action: str, symbol: str, qty: float, price: float, trade_id: int, timeout_sec: int):
     with ENGINE_LOCK:
@@ -386,23 +386,21 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
         side = "BUY" if "BUY" in action else "SELL"
         is_reversal = "REVERSE" in action
 
-        # 1. Execute Position Reversal / Liquidation if necessary
+        # 1. Immediate Reversal: Cancel active SL and market exit previous active trade
         live_qty, live_side = get_exchange_position_state(target)
         if (live_qty > 0.0 and live_side != side) or is_reversal:
-            print(f"[REVERSAL TRIGGERED] Liquidating existing {live_side} position...", flush=True)
+            print(f"[REVERSAL TRIGGERED] Immediately closing {live_side} position...", flush=True)
             if BOT_STATE.get("sl_id"):
                 cancel_order(BOT_STATE["sl_id"])
+                BOT_STATE["sl_id"] = None
             if live_qty > 0.0:
                 flatten_position(target, "SELL" if live_side == "BUY" else "BUY", live_qty)
-            time.sleep(0.2) # Allow exchange position table to clear
+            time.sleep(0.2)
 
-        # 2. Clear any lingering entry or stop orders
+        # 2. Cancel resting limit entries
         if BOT_STATE.get("entry_id"):
             cancel_order(BOT_STATE["entry_id"])
             BOT_STATE["entry_id"] = None
-        if BOT_STATE.get("sl_id"):
-            cancel_order(BOT_STATE["sl_id"])
-            BOT_STATE["sl_id"] = None
 
         BOT_STATE["trade_id"] = trade_id
         BOT_STATE["side"] = side
@@ -413,7 +411,7 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
         BOT_STATE["sl_price"] = 0.0
         save_state()
 
-        # 3. Post New Limit Order
+        # 3. Post New Limit Entry
         clean_p = float(f"{price:.2f}")
         clean_q = float(f"{qty:.4f}")
         payload = {
@@ -489,7 +487,7 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
                     save_state()
 
 # =============================================================================
-# WEBHOOK RECEIVER
+# FASTAPI RECEIVER
 # =============================================================================
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
