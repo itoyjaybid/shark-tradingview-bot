@@ -226,7 +226,7 @@ def get_current_ticker_price(symbol: str) -> float:
     return 0.0
 
 # =============================================================================
-# FLASH CRASH & SLIPPAGE SWEEPER (Condition 3)
+# FLASH CRASH & SLIPPAGE SWEEPER
 # =============================================================================
 def monitor_slippage_and_spike_fallback(symbol: str, sl_client_id: str, limit_price: float, side: str, qty: float, trade_id: int):
     target = clean_symbol(symbol)
@@ -301,14 +301,15 @@ def flatten_position(symbol: str, side: str, qty: float):
     send_signed_order(payload)
 
 # =============================================================================
-# ENTRY FILL WATCHER
+# HYBRID FILL WATCHER (ORDER DETAIL + ACTIVE POSITION BACKSTOP)
 # =============================================================================
-def check_fill_status(client_order_id: str, symbol: str) -> tuple[bool, float]:
+def check_fill_status(client_order_id: str, symbol: str, target_side: str, target_qty: float) -> tuple[bool, float]:
     target = clean_symbol(symbol)
     ts = str(get_synced_time())
     query = f"clientOrderId={client_order_id}&symbol={target}&timestamp={ts}"
     headers = sign_data(query)
 
+    # 1. Order Detail API Check
     try:
         r = requests.get(f"{SHARK_BASE_URL}/v1/order/order-detail?{query}", headers=headers, timeout=2)
         if r.status_code == 200:
@@ -321,12 +322,19 @@ def check_fill_status(client_order_id: str, symbol: str) -> tuple[bool, float]:
                 exec_qty = float(order.get("executedQty") or order.get("cumQty") or order.get("filledQty") or 0.0)
                 p = float(order.get("avgPrice") or order.get("executedPrice") or order.get("price") or 0.0)
 
-                if st in ["FILLED", "SUCCESS", "EXECUTED", "COMPLETE"] or exec_qty > 0.0:
+                if st in ["FILLED", "SUCCESS", "EXECUTED", "COMPLETE"] or exec_qty >= (target_qty * 0.90):
                     return True, p
                 if st in ["CANCELED", "CANCELLED", "REJECTED", "EXPIRED"]:
                     return False, -1.0
     except Exception as e:
         print(f"[STATUS CHECK ERROR]: {e}", flush=True)
+
+    # 2. Live Position Backstop Check (Catches instant executions when order-detail lags)
+    live_qty, live_side = get_exchange_position_state(target)
+    if live_qty >= (target_qty * 0.90) and live_side == target_side:
+        curr_p = get_current_ticker_price(target)
+        print(f">>> [LIVE POSITION DETECTED] Shark Exchange confirms active position: {live_side} {live_qty}", flush=True)
+        return True, curr_p
 
     return False, 0.0
 
@@ -345,14 +353,14 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
             print(f"[WATCHER] Trade {trade_id} superseded. Exiting.", flush=True)
             return
 
-        filled, exec_p = check_fill_status(order_id, target)
+        filled, exec_p = check_fill_status(order_id, target, side, qty)
         if exec_p == -1.0:
             print(f"[WATCHER] Order {order_id} canceled or rejected by exchange. Exiting.", flush=True)
             return
 
         if filled:
             real_fill = exec_p if exec_p > 0 else limit_price
-            print(f">>> [FILL CONFIRMED] Limit order verified filled @ {real_fill}", flush=True)
+            print(f">>> [FILL CONFIRMED] Entry executed @ {real_fill}", flush=True)
 
             with ENGINE_LOCK:
                 BOT_STATE["side"] = side
@@ -361,7 +369,7 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
                 BOT_STATE["entry_id"] = None
                 save_state()
 
-                # Condition 14: Place Stop Loss 100 pts away from verified fill price
+                # Condition 14: Stop Loss relative to actual execution price
                 initial_stop = round(real_fill - 100.0, 2) if side == "BUY" else round(real_fill + 100.0, 2)
                 sl_id = place_stop_loss(target, sl_side, qty, initial_stop, trade_id)
                 if sl_id:
@@ -386,7 +394,7 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
         side = "BUY" if "BUY" in action else "SELL"
         is_reversal = "REVERSE" in action
 
-        # 1. Immediate Reversal: Cancel active SL and market exit previous active trade
+        # 1. Condition 7: Immediate Reversal liquidation
         live_qty, live_side = get_exchange_position_state(target)
         if (live_qty > 0.0 and live_side != side) or is_reversal:
             print(f"[REVERSAL TRIGGERED] Immediately closing {live_side} position...", flush=True)
@@ -397,7 +405,7 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
                 flatten_position(target, "SELL" if live_side == "BUY" else "BUY", live_qty)
             time.sleep(0.2)
 
-        # 2. Cancel resting limit entries
+        # 2. Cancel open limit orders
         if BOT_STATE.get("entry_id"):
             cancel_order(BOT_STATE["entry_id"])
             BOT_STATE["entry_id"] = None
@@ -411,7 +419,7 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
         BOT_STATE["sl_price"] = 0.0
         save_state()
 
-        # 3. Post New Limit Entry
+        # 3. Post New Limit Order
         clean_p = float(f"{price:.2f}")
         clean_q = float(f"{qty:.4f}")
         payload = {
@@ -487,7 +495,7 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
                     save_state()
 
 # =============================================================================
-# FASTAPI RECEIVER
+# WEBHOOK RECEIVER
 # =============================================================================
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
