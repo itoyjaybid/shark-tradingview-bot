@@ -29,8 +29,20 @@ WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MY_SECRET_KEY").strip()
 CURRENT_POSITION_SIDE = None
 ACTIVE_SL_CLIENT_IDS = []
 
-# Slippage protection buffer for STOP_LIMIT orders
+# 15-point threshold limit buffer
 SL_LIMIT_BUFFER_PTS = 15.0
+
+
+def format_price(val: float):
+    """Formats prices to avoid .0 float signature mismatches on Node.js backends."""
+    f = round(float(val), 2)
+    return int(f) if f.is_integer() else f
+
+
+def format_qty(val: float):
+    """Formats quantities to avoid .0 float signature mismatches on Node.js backends."""
+    f = round(float(val), 4)
+    return int(f) if f.is_integer() else f
 
 
 def generate_signature(secret: str, data: str) -> str:
@@ -50,8 +62,8 @@ def get_real_exchange_position(symbol: str) -> float:
     """
     Fetches the live open position size directly from Shark Exchange.
     Returns:
-       > 0 for Long (e.g., +0.05)
-       < 0 for Short (e.g., -0.05)
+       > 0 for Long (e.g., +0.002)
+       < 0 for Short (e.g., -0.002)
        0.0 for Flat
     """
     try:
@@ -117,7 +129,7 @@ def cancel_all_tracked_stops():
 
 
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, ref_price: float = 0.0):
-    """Places STOP_LIMIT order with 15-point buffer, reduceOnly=True, and price validation."""
+    """Places STOP_LIMIT order with 15-point buffer, reduceOnly=True, and signature-safe types."""
     global ACTIVE_SL_CLIENT_IDS
     try:
         if ref_price > 0:
@@ -128,19 +140,23 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
                 print(f"[REJECTED GUARD] Short SL ({stop_price}) <= Market Price ({ref_price}). Skipping.")
                 return
 
-        time.sleep(0.15)
+        time.sleep(0.2)
         sl_timestamp = str(int(time.time() * 1000))
 
-        # Calculate limit execution threshold using the 15-point offset
+        # Calculate limit price with 15-point buffer
         if side == "SELL":
-            limit_price = round(stop_price - SL_LIMIT_BUFFER_PTS, 2)
+            limit_val = float(stop_price) - SL_LIMIT_BUFFER_PTS
         else:
-            limit_price = round(stop_price + SL_LIMIT_BUFFER_PTS, 2)
+            limit_val = float(stop_price) + SL_LIMIT_BUFFER_PTS
+
+        clean_stop = format_price(stop_price)
+        clean_limit = format_price(limit_val)
+        clean_quantity = format_qty(quantity)
 
         sl_params = {
             "timestamp": sl_timestamp,
             "placeType": "ORDER_FORM",
-            "quantity": quantity,
+            "quantity": clean_quantity,
             "side": side,
             "symbol": symbol,
             "type": "STOP_LIMIT",
@@ -148,15 +164,17 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
             "marginAsset": "INR",
             "deviceType": "WEB",
             "userCategory": "EXTERNAL",
-            "stopPrice": stop_price,
-            "price": limit_price
+            "stopPrice": clean_stop,
+            "price": clean_limit
         }
 
         sl_body = json.dumps(sl_params, separators=(",", ":"))
         sl_headers = get_headers(sl_body)
 
-        print(f"[STOP LIMIT] Submitting {side} STOP_LIMIT for {quantity} {symbol} | Trigger: {stop_price} | Limit: {limit_price}...")
+        print(f"[STOP LIMIT] Submitting {side} for {clean_quantity} {symbol} | Trigger: {clean_stop} | Limit: {clean_limit}...")
         resp = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=sl_body, headers=sl_headers, timeout=5)
+
+        print(f"[SL RESPONSE] HTTP {resp.status_code}: {resp.text}")
 
         if resp.status_code in [200, 201]:
             res_data = resp.json()
@@ -175,12 +193,12 @@ def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float, 
 def execute_entry_order(action: str, symbol: str, quantity: float, sl_price: float = 0.0, current_price: float = 0.0):
     """
     Executes entry dynamically based on the live position size on Shark Exchange.
-    Automatically prevents over-sizing from paused, missed, or duplicate alerts.
+    Automatically prevents over-sizing from duplicate or reversed alerts.
     """
     global CURRENT_POSITION_SIDE
     try:
         clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("-", "").replace("/", "").upper()
-        target_qty = float(quantity)
+        target_qty = format_qty(quantity)
 
         # 1. Query live balance on the exchange
         real_current_pos = get_real_exchange_position(clean_symbol)
@@ -198,11 +216,10 @@ def execute_entry_order(action: str, symbol: str, quantity: float, sl_price: flo
             return
 
         side = "BUY" if diff > 0 else "SELL"
-        exec_qty = round(abs(diff), 4)
+        exec_qty = format_qty(abs(diff))
 
-        raw_sl = float(sl_price) if sl_price else 0.0
-        stop_price = int(raw_sl) if raw_sl.is_integer() else round(raw_sl, 2)
-        ref_price = float(current_price) if current_price else 0.0
+        stop_price = format_price(sl_price) if sl_price else 0.0
+        ref_price = format_price(current_price) if current_price else 0.0
 
         # Step A: Clear existing resting stop orders
         cancel_all_tracked_stops()
@@ -260,12 +277,9 @@ def update_trailing_stop(symbol: str, quantity: float, sl_price: float, current_
                 print(f"[GUARD TRIGGERED] Discarding UPDATE_SL: No active trade tracked for {clean_symbol}.")
                 return
 
-        raw_qty = float(quantity)
-        order_qty = int(raw_qty) if raw_qty.is_integer() else round(raw_qty, 4)
-
-        raw_sl = float(sl_price) if sl_price else 0.0
-        stop_price = int(raw_sl) if raw_sl.is_integer() else round(raw_sl, 2)
-        ref_price = float(current_price) if current_price else 0.0
+        order_qty = format_qty(quantity)
+        stop_price = format_price(sl_price) if sl_price else 0.0
+        ref_price = format_price(current_price) if current_price else 0.0
 
         if stop_price > 0:
             sl_side = "SELL" if CURRENT_POSITION_SIDE == "BUY" else "BUY"
@@ -303,7 +317,7 @@ async def receive_webhook(request: Request):
 
     action = str(data.get("action", "")).upper()
     symbol = str(data.get("symbol", "BTCUSDT"))
-    quantity = float(data.get("quantity", 0.05))
+    quantity = float(data.get("quantity", 0.002))
     sl_price = float(data.get("sl_price", 0.0))
     current_price = float(data.get("price", 0.0))
 
