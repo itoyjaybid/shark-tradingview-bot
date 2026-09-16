@@ -110,7 +110,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # =============================================================================
-# SIGNING & HTTP DISPATCH WITH 4007 AUTO-RETRY
+# SIGNING & HTTP DISPATCH WITH VERBOSE LOGGING
 # =============================================================================
 def sign_data(data_str: str) -> dict:
     sig = hmac.new(
@@ -133,30 +133,31 @@ def clean_symbol(sym: str) -> str:
 def send_signed_order(payload: dict, max_retries: int = 3) -> tuple[bool, str]:
     for attempt in range(max_retries):
         if attempt > 0:
+            time.sleep(0.15)
             sync_clock_directly()
-            time.sleep(0.08)
 
         payload["timestamp"] = get_synced_time()
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         headers = sign_data(body)
 
         try:
-            r = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=body, headers=headers, timeout=3)
+            r = requests.post(f"{SHARK_BASE_URL}/v1/order/place-order", data=body, headers=headers, timeout=4)
+            print(f"[EXCHANGE RESPONSE] Status: {r.status_code} | Body: {r.text}", flush=True)
+
             if r.status_code in [200, 201]:
                 res = r.json()
                 cid = res.get("clientOrderId") or res.get("data", {}).get("clientOrderId")
                 return True, cid
 
-            if r.status_code == 403 or "4007" in r.text or "Signature mismatch" in r.text:
-                print(f"[SIGNATURE RETRY] Attempt {attempt + 1} hit 4007. Resyncing clock...", flush=True)
+            if "4007" in r.text or "Signature" in r.text or r.status_code == 403:
+                print(f"[SIGNATURE RETRY] Attempt {attempt + 1} failed. Resyncing clock...", flush=True)
                 continue
 
-            print(f"[EXCHANGE REJECTED] HTTP {r.status_code}: {r.text}", flush=True)
             return False, None
 
         except Exception as e:
             print(f"[DISPATCH ERROR]: {e}", flush=True)
-            time.sleep(0.08)
+            time.sleep(0.1)
 
     return False, None
 
@@ -329,7 +330,7 @@ def check_fill_status(client_order_id: str, symbol: str, target_side: str, targe
     except Exception as e:
         print(f"[STATUS CHECK ERROR]: {e}", flush=True)
 
-    # 2. Live Position Backstop Check (Catches instant executions when order-detail lags)
+    # 2. Live Position Backstop Check
     live_qty, live_side = get_exchange_position_state(target)
     if live_qty >= (target_qty * 0.90) and live_side == target_side:
         curr_p = get_current_ticker_price(target)
