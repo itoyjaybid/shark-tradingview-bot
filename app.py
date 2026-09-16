@@ -506,6 +506,10 @@ def get_exchange_position_state(symbol: str):
             )
 
             if r.status_code != 200:
+                print(
+                    f"[POSITION CHECK FAILED] {ep} -> HTTP {r.status_code}: {r.text}",
+                    flush=True
+                )
                 continue
 
             res = r.json()
@@ -538,7 +542,8 @@ def get_exchange_position_state(symbol: str):
 
                 return 0.0, "FLAT"
 
-        except Exception:
+        except Exception as e:
+            print(f"[POSITION CHECK ERROR] {ep} -> {e}", flush=True)
             continue
 
     return 0.0, "FLAT"
@@ -785,6 +790,11 @@ def check_order_status(client_order_id: str, symbol: str):
         )
 
         if r.status_code != 200:
+            print(
+                f"[ORDER STATUS FAILED] ID={client_order_id} -> "
+                f"HTTP {r.status_code}: {r.text}",
+                flush=True
+            )
             return "UNKNOWN", 0.0
 
         res = r.json()
@@ -881,12 +891,21 @@ def entry_order_watcher(
 
     target = clean_symbol(symbol)
     start = time.time()
+    last_heartbeat = start
 
     print(f"[ENTRY WATCHER] ID={order_id} Timeout={timeout_sec}s", flush=True)
 
     while time.time() - start < timeout_sec:
 
         time.sleep(0.8)
+
+        if time.time() - last_heartbeat >= 10:
+            print(
+                f"[ENTRY WATCHER] Still waiting on {order_id} "
+                f"({int(time.time() - start)}s elapsed)",
+                flush=True
+            )
+            last_heartbeat = time.time()
 
         with ENGINE_LOCK:
             if BOT_STATE.get("trade_id") != trade_id:
