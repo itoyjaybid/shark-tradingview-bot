@@ -767,6 +767,14 @@ def check_order_status(client_order_id: str, symbol: str):
             return "UNKNOWN", 0.0
 
         res = r.json()
+
+        # TEMP DEBUG - remove once Shark's order-detail schema is confirmed.
+        # This prints the raw response so we can see the exact field names
+        # this endpoint actually uses (place-order used orderAmount /
+        # filledAmount rather than the executedQty/status names originally
+        # assumed here).
+        print(f"[ORDER STATUS RAW] {res}", flush=True)
+
         order = res.get("data", res)
 
         if isinstance(order, dict):
@@ -781,27 +789,47 @@ def check_order_status(client_order_id: str, symbol: str):
                 or ""
             ).upper()
 
-            executed_qty = float(
-                order.get("executedQty")
+            # Shark's place-order response uses orderAmount / filledAmount,
+            # not executedQty / cumQty / filledQty. Check both families of
+            # names so we're not blind to fills just because the status
+            # string is missing or spelled differently.
+            order_amount = float(
+                order.get("orderAmount")
+                or order.get("quantity")
+                or order.get("origQty")
+                or 0.0
+            )
+
+            filled_amount = float(
+                order.get("filledAmount")
+                or order.get("executedQty")
                 or order.get("cumQty")
                 or order.get("filledQty")
+                or order.get("filledQuantity")
                 or 0.0
             )
 
             avg_price = float(
                 order.get("avgPrice")
+                or order.get("avgFillPrice")
+                or order.get("averagePrice")
                 or order.get("executedPrice")
                 or order.get("price")
+                or order.get("limitPrice")
                 or 0.0
             )
-
-            if status in ["FILLED", "SUCCESS", "EXECUTED", "COMPLETE"]:
-                return "FILLED", avg_price
 
             if status in ["CANCELED", "CANCELLED", "REJECTED", "EXPIRED"]:
                 return "CANCELLED", -1.0
 
-            if executed_qty > 0:
+            if status in ["FILLED", "SUCCESS", "EXECUTED", "COMPLETE"]:
+                return "FILLED", avg_price
+
+            # No usable status string, but the amounts tell the real story.
+            if order_amount > 0 and filled_amount >= order_amount * 0.999:
+                return "FILLED", avg_price
+
+            if filled_amount > 0:
                 return "PARTIAL", avg_price
 
             return "OPEN", 0.0
@@ -856,14 +884,42 @@ def entry_order_watcher(
                     save_state()
             return
 
-        if status in ["FILLED", "PARTIAL"]:
+        filled_via_order_detail = status in ["FILLED", "PARTIAL"]
+
+        # -------------------------------------------------------------------
+        # BACKSTOP: check the live exchange position independently of
+        # check_order_status()'s parsing. If order-detail's field names are
+        # ever wrong again (as happened - Shark uses orderAmount/filledAmount,
+        # not executedQty/status), this still catches a real fill instead of
+        # silently timing out and cancelling an already-filled order.
+        # -------------------------------------------------------------------
+        filled_via_backstop = False
+
+        if not filled_via_order_detail:
+            backstop_qty, backstop_side = get_exchange_position_state(target)
+            if backstop_qty >= qty * 0.999 and backstop_side == side:
+                filled_via_backstop = True
+                print(
+                    f"[ENTRY WATCHER] Order-detail did not confirm, but "
+                    f"exchange shows a live {backstop_side} position "
+                    f"Qty={backstop_qty} - treating as FILLED via backstop.",
+                    flush=True
+                )
+
+        if filled_via_order_detail or filled_via_backstop:
 
             live_qty, live_side = get_exchange_position_state(target)
             if live_qty <= 0:
                 continue
 
-            # Real fill price from Shark - NOT TradingView's price.
-            real_fill = exec_price if exec_price > 0 else limit_price
+            # Real fill price from Shark order-detail when available;
+            # otherwise fall back to the current ticker price (backstop
+            # path), and only as a last resort to the requested limit price.
+            if exec_price > 0:
+                real_fill = exec_price
+            else:
+                ticker_price = get_current_ticker_price(target)
+                real_fill = ticker_price if ticker_price > 0 else limit_price
 
             print(
                 f"[ENTRY FILLED] {live_side} Qty={live_qty} Price={real_fill}",
