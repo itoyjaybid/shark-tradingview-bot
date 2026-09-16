@@ -485,68 +485,83 @@ def edit_stop_order(
 # =============================================================================
 
 def get_exchange_position_state(symbol: str):
+    """
+    Uses the documented endpoint: GET /v1/positions/{positionStatus}
+    (there is no /v1/position/open-positions or bare /v1/positions in
+    Shark's actual API - those were guessed and never worked).
+    Response fields per docs: contractPair (not symbol), positionType
+    ("LONG"/"SHORT", not side/positionSide), positionAmount (already
+    unsigned - direction comes from positionType, not a negative sign).
+    """
 
     target = clean_symbol(symbol)
     ts = str(get_synced_time())
 
-    endpoints = [
-        f"/v1/position/open-positions?symbol={target}&timestamp={ts}",
-        f"/v1/positions?symbol={target}&timestamp={ts}"
-    ]
+    params = {
+        "sortOrder": "desc",
+        "pageSize": "100",
+        "symbol": target,
+        "timestamp": ts
+    }
+    query_string = "&".join(f"{k}={v}" for k, v in params.items())
 
-    for ep in endpoints:
-        try:
-            querystr = ep.split("?")[1]
-            headers = sign_data(querystr)
+    endpoint = f"/v1/positions/OPEN?{query_string}"
+    headers = sign_data(query_string)
 
-            r = requests.get(
-                f"{SHARK_BASE_URL}{ep}",
-                headers=headers,
-                timeout=3
+    try:
+        r = requests.get(
+            f"{SHARK_BASE_URL}{endpoint}",
+            headers=headers,
+            timeout=3
+        )
+
+        if r.status_code != 200:
+            print(
+                f"[POSITION CHECK FAILED] {endpoint} -> "
+                f"HTTP {r.status_code}: {r.text}",
+                flush=True
             )
+            return 0.0, "FLAT"
 
-            if r.status_code != 200:
-                print(
-                    f"[POSITION CHECK FAILED] {ep} -> HTTP {r.status_code}: {r.text}",
-                    flush=True
-                )
+        res = r.json()
+        data = res if isinstance(res, list) else res.get("data", res)
+        items = data if isinstance(data, list) else [data]
+
+        for pos in items:
+            if not isinstance(pos, dict):
                 continue
 
-            res = r.json()
-            data = res.get("data", res)
-            items = data if isinstance(data, list) else [data]
+            sym = str(
+                pos.get("contractPair") or pos.get("symbol") or ""
+            ).upper()
+            if target not in sym and sym not in target:
+                continue
 
-            for pos in items:
-                if not isinstance(pos, dict):
-                    continue
+            raw_qty = float(
+                pos.get("positionAmount")
+                or pos.get("quantity")
+                or pos.get("positionAmt")
+                or pos.get("size")
+                or 0.0
+            )
 
-                sym = str(pos.get("symbol", "")).upper()
-                if target not in sym and sym not in target:
-                    continue
+            position_type = str(
+                pos.get("positionType")
+                or pos.get("side")
+                or pos.get("positionSide")
+                or ""
+            ).upper()
 
-                raw_qty = float(
-                    pos.get("positionAmt")
-                    or pos.get("size")
-                    or pos.get("positionAmount")
-                    or 0.0
-                )
+            if abs(raw_qty) > 0.000001:
+                if position_type in ["SHORT", "SELL"] or raw_qty < 0:
+                    return abs(raw_qty), "SELL"
+                return abs(raw_qty), "BUY"
 
-                side_str = str(
-                    pos.get("side") or pos.get("positionSide") or ""
-                ).upper()
+        return 0.0, "FLAT"
 
-                if abs(raw_qty) > 0.000001:
-                    if side_str in ["SHORT", "SELL"] or raw_qty < 0:
-                        return abs(raw_qty), "SELL"
-                    return abs(raw_qty), "BUY"
-
-                return 0.0, "FLAT"
-
-        except Exception as e:
-            print(f"[POSITION CHECK ERROR] {ep} -> {e}", flush=True)
-            continue
-
-    return 0.0, "FLAT"
+    except Exception as e:
+        print(f"[POSITION CHECK ERROR] {endpoint} -> {e}", flush=True)
+        return 0.0, "FLAT"
 
 
 # =============================================================================
@@ -572,16 +587,18 @@ def wait_until_flat(symbol: str, timeout_sec: float = 5.0) -> bool:
 # =============================================================================
 
 def get_current_ticker_price(symbol: str) -> float:
+    """
+    Uses the documented PUBLIC endpoint: GET /v1/market/ticker24Hr/{pair}
+    (there is no /v1/ticker/price in Shark's actual API - that was
+    guessed and never worked). No signature/timestamp required - this
+    is a public market data endpoint. Response field "c" = last price.
+    """
 
-    target = clean_symbol(symbol)
-    ts = str(get_synced_time())
-    query = f"symbol={target}&timestamp={ts}"
-    headers = sign_data(query)
+    pair = clean_symbol(symbol).lower()
 
     try:
         r = requests.get(
-            f"{SHARK_BASE_URL}/v1/ticker/price?{query}",
-            headers=headers,
+            f"{SHARK_BASE_URL}/v1/market/ticker24Hr/{pair}",
             timeout=3
         )
 
@@ -589,10 +606,22 @@ def get_current_ticker_price(symbol: str) -> float:
             res = r.json()
             data = res.get("data", res)
             if isinstance(data, dict):
-                return float(data.get("price") or data.get("lastPrice") or 0.0)
+                price = (
+                    data.get("c")
+                    or data.get("price")
+                    or data.get("lastPrice")
+                )
+                if price is not None:
+                    return float(price)
+        else:
+            print(
+                f"[TICKER CHECK FAILED] {pair} -> "
+                f"HTTP {r.status_code}: {r.text}",
+                flush=True
+            )
 
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[TICKER CHECK ERROR] {pair} -> {e}", flush=True)
 
     return 0.0
 
@@ -776,15 +805,22 @@ def flatten_position(symbol: str, side: str, qty: float) -> bool:
 # =============================================================================
 
 def check_order_status(client_order_id: str, symbol: str):
+    """
+    Uses the documented endpoint: GET /v1/order/{clientOrderId}
+    (there is no /v1/order/order-detail in Shark's actual API - that
+    was guessed and never worked, which is why fills were never being
+    detected). Response fields per docs: status, filledQty (net filled),
+    executedQty (last filled), avgPrice, quantity (order size).
+    """
 
     target = clean_symbol(symbol)
     ts = str(get_synced_time())
-    query = f"clientOrderId={client_order_id}&symbol={target}&timestamp={ts}"
+    query = f"timestamp={ts}"
     headers = sign_data(query)
 
     try:
         r = requests.get(
-            f"{SHARK_BASE_URL}/v1/order/order-detail?{query}",
+            f"{SHARK_BASE_URL}/v1/order/{client_order_id}?{query}",
             headers=headers,
             timeout=3
         )
@@ -799,52 +835,32 @@ def check_order_status(client_order_id: str, symbol: str):
 
         res = r.json()
 
-        # TEMP DEBUG - remove once Shark's order-detail schema is confirmed.
-        # This prints the raw response so we can see the exact field names
-        # this endpoint actually uses (place-order used orderAmount /
-        # filledAmount rather than the executedQty/status names originally
-        # assumed here).
+        # TEMP DEBUG - safe to remove once this is confirmed working
+        # against the corrected /v1/order/{clientOrderId} endpoint.
         print(f"[ORDER STATUS RAW] {res}", flush=True)
 
-        order = res.get("data", res)
+        order = res.get("data", res) if isinstance(res, dict) else res
 
         if isinstance(order, dict):
 
-            if "order" in order and isinstance(order["order"], dict):
-                order = order["order"]
+            status = str(order.get("status") or "").upper()
 
-            status = str(
-                order.get("status")
-                or order.get("orderStatus")
-                or order.get("state")
-                or ""
-            ).upper()
-
-            # Shark's place-order response uses orderAmount / filledAmount,
-            # not executedQty / cumQty / filledQty. Check both families of
-            # names so we're not blind to fills just because the status
-            # string is missing or spelled differently.
             order_amount = float(
-                order.get("orderAmount")
-                or order.get("quantity")
+                order.get("quantity")
+                or order.get("orderAmount")
                 or order.get("origQty")
                 or 0.0
             )
 
             filled_amount = float(
-                order.get("filledAmount")
+                order.get("filledQty")
                 or order.get("executedQty")
-                or order.get("cumQty")
-                or order.get("filledQty")
-                or order.get("filledQuantity")
+                or order.get("filledAmount")
                 or 0.0
             )
 
             avg_price = float(
                 order.get("avgPrice")
-                or order.get("avgFillPrice")
-                or order.get("averagePrice")
-                or order.get("executedPrice")
                 or order.get("price")
                 or order.get("limitPrice")
                 or 0.0
