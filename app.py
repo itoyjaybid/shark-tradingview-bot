@@ -62,6 +62,7 @@ BOT_STATE = {
     "qty": 0.0,
 
     "entry_id": None,
+    "exchange_order_id": None,
     "sl_id": None,
 
     "fill_price": 0.0,
@@ -117,22 +118,16 @@ def remove_sl_watch(sl_id: str):
 
 def load_state():
     global BOT_STATE
-
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
                 loaded = json.load(f)
-
             BOT_STATE.update(loaded)
-
             print(
-                f"[STATE LOADED] "
-                f"TradeID={BOT_STATE.get('trade_id')} "
-                f"Side={BOT_STATE.get('side')} "
-                f"Qty={BOT_STATE.get('qty')}",
+                f"[STATE LOADED] TradeID={BOT_STATE.get('trade_id')} "
+                f"Side={BOT_STATE.get('side')} Qty={BOT_STATE.get('qty')}",
                 flush=True
             )
-
         except Exception as e:
             print(f"[STATE LOAD ERROR] {e}", flush=True)
 
@@ -140,34 +135,26 @@ def load_state():
 def save_state():
     try:
         temp_file = STATE_FILE + ".tmp"
-
         with open(temp_file, "w") as f:
             json.dump(BOT_STATE, f, indent=2)
-
         os.replace(temp_file, STATE_FILE)
-
     except Exception as e:
         print(f"[STATE SAVE ERROR] {e}", flush=True)
 
 
 def purge_state():
     old_sl_id = BOT_STATE.get("sl_id")
-
     BOT_STATE["trade_id"] = None
     BOT_STATE["side"] = None
     BOT_STATE["qty"] = 0.0
-
     BOT_STATE["entry_id"] = None
+    BOT_STATE["exchange_order_id"] = None
     BOT_STATE["sl_id"] = None
-
     BOT_STATE["fill_price"] = 0.0
     BOT_STATE["sl_price"] = 0.0
-
     BOT_STATE["entry_active"] = False
     BOT_STATE["position_active"] = False
-
     save_state()
-
     remove_sl_watch(old_sl_id)
 
 
@@ -177,46 +164,31 @@ def purge_state():
 
 def sync_clock_directly() -> int:
     global CLOCK_OFFSET_MS
-
     try:
-        r = requests.get(
-            f"{SHARK_BASE_URL}/v1/time",
-            timeout=2
-        )
-
+        r = requests.get(f"{SHARK_BASE_URL}/v1/time", timeout=2)
         if r.status_code == 200:
             res = r.json()
-            srv_ts = int(
-                res.get("serverTime")
-                or res.get("data")
-                or 0
-            )
-
+            srv_ts = int(res.get("serverTime") or res.get("data") or 0)
             if srv_ts > 0:
                 CLOCK_OFFSET_MS = srv_ts - int(time.time() * 1000)
                 return srv_ts
-
     except Exception:
         pass
-
     return int(time.time() * 1000) + CLOCK_OFFSET_MS
 
 
 def get_synced_time() -> int:
     global LAST_USED_TIMESTAMP
-
     with TS_LOCK:
         now_ts = int(time.time() * 1000) + CLOCK_OFFSET_MS
-
         if now_ts <= LAST_USED_TIMESTAMP:
             now_ts = LAST_USED_TIMESTAMP + 1
-
         LAST_USED_TIMESTAMP = now_ts
         return now_ts
 
 
 # =============================================================================
-# FASTAPI LIFESPAN
+# LIFESPAN
 # =============================================================================
 
 @asynccontextmanager
@@ -237,10 +209,8 @@ app = FastAPI(lifespan=lifespan)
 def clean_symbol(sym: str) -> str:
     if not sym:
         return DEFAULT_SYMBOL
-
     return (
-        sym
-        .replace("-", "")
+        sym.replace("-", "")
         .replace("_", "")
         .replace(".P", "")
         .replace(".p", "")
@@ -275,13 +245,7 @@ def send_signed_order(payload: dict, max_retries: int = 3):
             time.sleep(0.15)
 
         payload["timestamp"] = get_synced_time()
-
-        body = json.dumps(
-            payload,
-            separators=(",", ":"),
-            sort_keys=True
-        )
-
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         headers = sign_data(body)
 
         try:
@@ -296,30 +260,31 @@ def send_signed_order(payload: dict, max_retries: int = 3):
                 res = r.json()
                 data = res.get("data", {})
 
+                # Extract both clientOrderId and the exchange numeric order id
                 cid = (
                     res.get("clientOrderId")
                     or (data.get("clientOrderId") if isinstance(data, dict) else None)
                     or (data.get("orderId") if isinstance(data, dict) else None)
                     or res.get("orderId")
                 )
+                raw_id = res.get("id") or (data.get("id") if isinstance(data, dict) else None)
 
                 print(f"[ORDER SUCCESS] {res}", flush=True)
-                return True, cid
+                return True, cid, raw_id
 
             print(f"[EXCHANGE REJECTED] HTTP {r.status_code}: {r.text}", flush=True)
 
-            # Strict signature / clock drift retry check
             if "4007" in r.text or "Signature mismatch" in r.text or "timestamp" in r.text.lower():
                 print(f"[SIGNATURE RETRY] Attempt {attempt + 1}", flush=True)
                 continue
 
-            return False, None
+            return False, None, None
 
         except Exception as e:
             print(f"[DISPATCH ERROR] {e}", flush=True)
             time.sleep(0.10)
 
-    return False, None
+    return False, None, None
 
 
 # =============================================================================
@@ -334,7 +299,6 @@ def cancel_order(client_order_id: str) -> bool:
         "clientOrderId": str(client_order_id),
         "timestamp": get_synced_time()
     }
-
     body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     headers = sign_data(body)
 
@@ -346,7 +310,6 @@ def cancel_order(client_order_id: str) -> bool:
             timeout=4
         )
 
-        # 3060 means order already completed/not active; treat as resolved
         if r.status_code in [200, 201, 204] or "3060" in r.text or "not found" in r.text.lower():
             print(f"[ORDER RESOLVED/CANCELLED] {client_order_id}", flush=True)
             return True
@@ -360,7 +323,7 @@ def cancel_order(client_order_id: str) -> bool:
 
 
 # =============================================================================
-# EDIT EXISTING STOP ORDER
+# EDIT STOP ORDER
 # =============================================================================
 
 def edit_stop_order(
@@ -379,7 +342,6 @@ def edit_stop_order(
         "price": float(f"{limit_price:.2f}"),
         "timestamp": get_synced_time()
     }
-
     body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     headers = sign_data(body)
 
@@ -415,9 +377,12 @@ def get_exchange_position_state(symbol: str):
     target = clean_symbol(symbol)
     ts = str(get_synced_time())
 
+    # Check both filtered and unfiltered variants
     endpoints = [
         f"/v1/position/open-positions?symbol={target}&timestamp={ts}",
-        f"/v1/positions?symbol={target}&timestamp={ts}"
+        f"/v1/positions?symbol={target}&timestamp={ts}",
+        f"/v1/position/open-positions?timestamp={ts}",
+        f"/v1/positions?timestamp={ts}"
     ]
 
     for ep in endpoints:
@@ -448,8 +413,8 @@ def get_exchange_position_state(symbol: str):
                 if not isinstance(pos, dict):
                     continue
 
-                raw_sym = clean_symbol(str(pos.get("symbol", "")))
-                if target not in raw_sym and raw_sym not in target:
+                pos_sym = clean_symbol(str(pos.get("symbol", "")))
+                if pos_sym != target and target not in pos_sym:
                     continue
 
                 raw_qty = float(
@@ -460,34 +425,26 @@ def get_exchange_position_state(symbol: str):
                     or 0.0
                 )
 
-                side_str = str(
-                    pos.get("side") or pos.get("positionSide") or ""
-                ).upper()
+                side_str = str(pos.get("side") or pos.get("positionSide") or "").upper()
 
                 if abs(raw_qty) > 0.000001:
-                    if side_str in ["SHORT", "SELL"] or raw_qty < 0:
-                        return abs(raw_qty), "SELL"
-                    return abs(raw_qty), "BUY"
+                    resolved_side = "SELL" if (side_str in ["SHORT", "SELL"] or raw_qty < 0) else "BUY"
+                    return abs(raw_qty), resolved_side
 
-        except Exception:
+        except Exception as e:
+            print(f"[POS CHECK ERROR] {e}", flush=True)
             continue
 
     return 0.0, "FLAT"
 
 
-# =============================================================================
-# WAIT UNTIL EXCHANGE POSITION IS FLAT
-# =============================================================================
-
 def wait_until_flat(symbol: str, timeout_sec: float = 5.0) -> bool:
     start = time.time()
-
     while time.time() - start < timeout_sec:
         qty, _ = get_exchange_position_state(symbol)
         if qty <= 0.000001:
             return True
         time.sleep(0.20)
-
     qty, _ = get_exchange_position_state(symbol)
     return qty <= 0.000001
 
@@ -514,7 +471,6 @@ def get_current_ticker_price(symbol: str) -> float:
             data = res.get("data", res)
             if isinstance(data, dict):
                 return float(data.get("price") or data.get("lastPrice") or 0.0)
-
     except Exception:
         pass
 
@@ -554,16 +510,12 @@ def place_stop_loss(
         "userCategory": "EXTERNAL"
     }
 
-    print(
-        f"[STOP PLACE] {side} Stop={stop_price} Limit={limit_price}",
-        flush=True
-    )
+    print(f"[STOP PLACE] {side} Stop={stop_price} Limit={limit_price}", flush=True)
 
-    ok, cid = send_signed_order(payload)
+    ok, cid, _ = send_signed_order(payload)
 
     if ok and cid:
         print(f"[STOP PLACED] ID={cid}", flush=True)
-
         register_sl_watch(cid, stop_price, limit_price, side, qty)
 
         threading.Thread(
@@ -605,10 +557,7 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
         if live_qty <= 0.000001:
             with ENGINE_LOCK:
                 if BOT_STATE.get("trade_id") == trade_id:
-                    print(
-                        "[STOP MONITOR] Position is FLAT. Clearing trade state.",
-                        flush=True
-                    )
+                    print("[STOP MONITOR] Position is FLAT. Clearing trade state.", flush=True)
                     purge_state()
             remove_sl_watch(sl_id)
             return
@@ -617,22 +566,13 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
         if curr_price <= 0:
             continue
 
-        if sl_side == "SELL":
-            breached = curr_price < limit_price
-        else:
-            breached = curr_price > limit_price
+        breached = (curr_price < limit_price) if sl_side == "SELL" else (curr_price > limit_price)
 
         if breached:
-            print(
-                f"[STOP GAP] Price={curr_price} Limit={limit_price}",
-                flush=True
-            )
+            print(f"[STOP GAP] Price={curr_price} Limit={limit_price}", flush=True)
 
             with ENGINE_LOCK:
-                if (
-                    BOT_STATE.get("sl_id") == sl_id
-                    and BOT_STATE.get("trade_id") == trade_id
-                ):
+                if BOT_STATE.get("sl_id") == sl_id and BOT_STATE.get("trade_id") == trade_id:
                     cancel_order(sl_id)
                     flatten_position(target, sl_side, live_qty)
                     wait_until_flat(target, timeout_sec=5)
@@ -652,7 +592,6 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
 
 def flatten_position(symbol: str, side: str, qty: float) -> bool:
     target = clean_symbol(symbol)
-
     if qty <= 0:
         return False
 
@@ -669,8 +608,7 @@ def flatten_position(symbol: str, side: str, qty: float) -> bool:
     }
 
     print(f"[MARKET EXIT] {side} {qty} {target}", flush=True)
-
-    ok, _ = send_signed_order(payload)
+    ok, _, _ = send_signed_order(payload)
     return ok
 
 
@@ -678,78 +616,86 @@ def flatten_position(symbol: str, side: str, qty: float) -> bool:
 # ORDER STATUS
 # =============================================================================
 
-def check_order_status(client_order_id: str, symbol: str):
+def check_order_status(client_order_id: str, symbol: str, exchange_id: int = None):
     target = clean_symbol(symbol)
     ts = str(get_synced_time())
-    query = f"clientOrderId={client_order_id}&symbol={target}&timestamp={ts}"
-    headers = sign_data(query)
+    
+    # Try querying by exchange id first if known, otherwise by clientOrderId
+    queries = []
+    if exchange_id:
+        queries.append(f"orderId={exchange_id}&symbol={target}&timestamp={ts}")
+    if client_order_id:
+        queries.append(f"clientOrderId={client_order_id}&symbol={target}&timestamp={ts}")
 
-    try:
-        r = requests.get(
-            f"{SHARK_BASE_URL}/v1/order/order-detail?{query}",
-            headers=headers,
-            timeout=3
-        )
-
-        if r.status_code != 200:
-            return "UNKNOWN", 0.0
-
-        res = r.json()
-        order = res.get("data", res)
-
-        if isinstance(order, dict):
-            if "order" in order and isinstance(order["order"], dict):
-                order = order["order"]
-
-            status = str(
-                order.get("status")
-                or order.get("orderStatus")
-                or order.get("state")
-                or ""
-            ).upper()
-
-            order_amount = float(
-                order.get("orderAmount")
-                or order.get("quantity")
-                or order.get("origQty")
-                or 0.0
+    for query in queries:
+        try:
+            headers = sign_data(query)
+            r = requests.get(
+                f"{SHARK_BASE_URL}/v1/order/order-detail?{query}",
+                headers=headers,
+                timeout=3
             )
 
-            filled_amount = float(
-                order.get("filledAmount")
-                or order.get("executedQty")
-                or order.get("cumQty")
-                or order.get("filledQty")
-                or order.get("filledQuantity")
-                or 0.0
-            )
+            if r.status_code != 200:
+                continue
 
-            avg_price = float(
-                order.get("avgPrice")
-                or order.get("avgFillPrice")
-                or order.get("averagePrice")
-                or order.get("executedPrice")
-                or order.get("price")
-                or order.get("limitPrice")
-                or 0.0
-            )
+            res = r.json()
+            print(f"[ORDER STATUS RAW] {res}", flush=True)
 
-            if status in ["CANCELED", "CANCELLED", "REJECTED", "EXPIRED"]:
-                return "CANCELLED", -1.0
+            order = res.get("data", res)
+            if isinstance(order, dict):
+                if "order" in order and isinstance(order["order"], dict):
+                    order = order["order"]
 
-            if status in ["FILLED", "SUCCESS", "EXECUTED", "COMPLETE"]:
-                return "FILLED", avg_price
+                status = str(
+                    order.get("status")
+                    or order.get("orderStatus")
+                    or order.get("state")
+                    or ""
+                ).upper()
 
-            if order_amount > 0 and filled_amount >= order_amount * 0.999:
-                return "FILLED", avg_price
+                order_amount = float(
+                    order.get("orderAmount")
+                    or order.get("quantity")
+                    or order.get("origQty")
+                    or 0.0
+                )
 
-            if filled_amount > 0:
-                return "PARTIAL", avg_price
+                filled_amount = float(
+                    order.get("filledAmount")
+                    or order.get("executedQty")
+                    or order.get("cumQty")
+                    or order.get("filledQty")
+                    or order.get("filledQuantity")
+                    or 0.0
+                )
 
-            return "OPEN", 0.0
+                avg_price = float(
+                    order.get("avgPrice")
+                    or order.get("avgFillPrice")
+                    or order.get("averagePrice")
+                    or order.get("executedPrice")
+                    or order.get("price")
+                    or order.get("limitPrice")
+                    or 0.0
+                )
 
-    except Exception as e:
-        print(f"[ORDER STATUS ERROR] {e}", flush=True)
+                if status in ["CANCELED", "CANCELLED", "REJECTED", "EXPIRED"]:
+                    return "CANCELLED", -1.0
+
+                if status in ["FILLED", "SUCCESS", "EXECUTED", "COMPLETE"]:
+                    return "FILLED", avg_price
+
+                if order_amount > 0 and filled_amount >= order_amount * 0.999:
+                    return "FILLED", avg_price
+
+                if filled_amount > 0:
+                    return "PARTIAL", avg_price
+
+                return "OPEN", 0.0
+
+        except Exception as e:
+            print(f"[ORDER STATUS ERROR] {e}", flush=True)
 
     return "UNKNOWN", 0.0
 
@@ -765,21 +711,22 @@ def entry_order_watcher(
     trade_id: int,
     qty: float,
     order_id: str,
-    timeout_sec: int
+    timeout_sec: int,
+    exchange_id: int = None
 ):
     target = clean_symbol(symbol)
     start = time.time()
 
-    print(f"[ENTRY WATCHER] ID={order_id} Timeout={timeout_sec}s", flush=True)
+    print(f"[ENTRY WATCHER] ID={order_id} ExchangeID={exchange_id} Timeout={timeout_sec}s", flush=True)
 
     while time.time() - start < timeout_sec:
-        time.sleep(0.8)
+        time.sleep(1.0)
 
         with ENGINE_LOCK:
             if BOT_STATE.get("trade_id") != trade_id or BOT_STATE.get("entry_id") != order_id:
                 return
 
-        status, exec_price = check_order_status(order_id, target)
+        status, exec_price = check_order_status(order_id, target, exchange_id)
 
         if status == "CANCELLED":
             print("[ENTRY WATCHER] Entry cancelled/rejected.", flush=True)
@@ -806,7 +753,8 @@ def entry_order_watcher(
         if filled_via_order_detail or filled_via_backstop:
             live_qty, live_side = get_exchange_position_state(target)
             if live_qty <= 0:
-                continue
+                live_qty = qty
+                live_side = side
 
             if exec_price > 0:
                 real_fill = exec_price
@@ -814,10 +762,7 @@ def entry_order_watcher(
                 ticker_price = get_current_ticker_price(target)
                 real_fill = ticker_price if ticker_price > 0 else limit_price
 
-            print(
-                f"[ENTRY FILLED] {live_side} Qty={live_qty} Price={real_fill}",
-                flush=True
-            )
+            print(f"[ENTRY FILLED] {live_side} Qty={live_qty} Price={real_fill}", flush=True)
 
             with ENGINE_LOCK:
                 if BOT_STATE.get("trade_id") != trade_id:
@@ -843,10 +788,7 @@ def entry_order_watcher(
                     BOT_STATE["sl_id"] = sl_id
                     BOT_STATE["sl_price"] = initial_stop
                 else:
-                    print(
-                        "[CRITICAL] Initial SL FAILED. Attempting MARKET EXIT.",
-                        flush=True
-                    )
+                    print("[CRITICAL] Initial SL FAILED. Attempting MARKET EXIT.", flush=True)
                     flatten_position(target, sl_side, live_qty)
                     wait_until_flat(target, 5)
                     purge_state()
@@ -889,21 +831,15 @@ def process_entry_signal(
 
         live_qty, live_side = get_exchange_position_state(target)
 
-        # Handle Position Reversal
+        # Handle Reversal
         if live_qty > 0 and live_side != side:
             print(f"[REVERSAL] Closing {live_side} before entering {side}", flush=True)
-
             opposite = "SELL" if live_side == "BUY" else "BUY"
             flatten_position(target, opposite, live_qty)
 
             confirmed_flat = wait_until_flat(target, timeout_sec=5)
-
             if not confirmed_flat:
-                print(
-                    "[REVERSAL ABORTED] Old position did not confirm flat. "
-                    "Existing stop left in place.",
-                    flush=True
-                )
+                print("[REVERSAL ABORTED] Old position did not confirm flat.", flush=True)
                 return
 
             if BOT_STATE.get("sl_id"):
@@ -911,25 +847,21 @@ def process_entry_signal(
 
             purge_state()
 
-        # Cancel pending entry orders
         if BOT_STATE.get("entry_id"):
             cancel_order(BOT_STATE["entry_id"])
             BOT_STATE["entry_id"] = None
             BOT_STATE["entry_active"] = False
 
-        # Verify not double entering
         live_qty, live_side = get_exchange_position_state(target)
         if live_qty > 0:
-            print(
-                f"[ENTRY BLOCKED] Existing {live_side} position Qty={live_qty}",
-                flush=True
-            )
+            print(f"[ENTRY BLOCKED] Existing {live_side} position Qty={live_qty}", flush=True)
             return
 
         BOT_STATE["trade_id"] = trade_id
         BOT_STATE["side"] = side
         BOT_STATE["qty"] = qty
         BOT_STATE["entry_id"] = None
+        BOT_STATE["exchange_order_id"] = None
         BOT_STATE["sl_id"] = None
         BOT_STATE["fill_price"] = 0.0
         BOT_STATE["sl_price"] = 0.0
@@ -955,7 +887,7 @@ def process_entry_signal(
 
         print(f"[ENTRY] {side} {clean_qty} {target} @ {clean_price}", flush=True)
 
-        ok, cid = send_signed_order(payload)
+        ok, cid, raw_id = send_signed_order(payload)
 
         if not ok or not cid:
             print("[ENTRY FAILED]", flush=True)
@@ -963,11 +895,12 @@ def process_entry_signal(
             return
 
         BOT_STATE["entry_id"] = cid
+        BOT_STATE["exchange_order_id"] = raw_id
         save_state()
 
         threading.Thread(
             target=entry_order_watcher,
-            args=(target, side, clean_price, trade_id, clean_qty, cid, timeout_sec),
+            args=(target, side, clean_price, trade_id, clean_qty, cid, timeout_sec, raw_id),
             daemon=True
         ).start()
 
@@ -1016,11 +949,9 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
 
             if edit_stop_order(old_sl_id, live_qty, new_stop, new_limit):
                 update_sl_watch(old_sl_id, stop_price=new_stop, limit_price=new_limit, qty=live_qty)
-
                 BOT_STATE["qty"] = live_qty
                 BOT_STATE["sl_price"] = new_stop
                 save_state()
-
                 print(f"[STOP UPDATED] {new_stop}", flush=True)
                 return
 
@@ -1051,11 +982,9 @@ def process_cancel_entry(symbol: str, trade_id: int):
     with ENGINE_LOCK:
         if BOT_STATE.get("trade_id") != trade_id:
             return
-
         entry_id = BOT_STATE.get("entry_id")
         if entry_id:
             cancel_order(entry_id)
-
         BOT_STATE["entry_id"] = None
         BOT_STATE["entry_active"] = False
         save_state()
@@ -1067,25 +996,17 @@ def process_cancel_entry(symbol: str, trade_id: int):
 
 def process_close(symbol: str):
     target = clean_symbol(symbol)
-
     with ENGINE_LOCK:
         if BOT_STATE.get("entry_id"):
             cancel_order(BOT_STATE["entry_id"])
 
         live_qty, live_side = get_exchange_position_state(target)
-
         if live_qty > 0:
             opposite = "SELL" if live_side == "BUY" else "BUY"
             flatten_position(target, opposite, live_qty)
-
             confirmed_flat = wait_until_flat(target, timeout_sec=5)
-
             if not confirmed_flat:
-                print(
-                    "[CLOSE ABORTED] Position did not confirm flat. "
-                    "Existing stop left in place.",
-                    flush=True
-                )
+                print("[CLOSE ABORTED] Position did not confirm flat.", flush=True)
                 return
 
         if BOT_STATE.get("sl_id"):
@@ -1167,6 +1088,5 @@ async def receive_webhook(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run("shark_bridge:app", host="0.0.0.0", port=port)
