@@ -48,13 +48,7 @@ TS_LOCK = threading.Lock()
 LAST_USED_TIMESTAMP = 0
 CLOCK_OFFSET_MS = 0
 
-# Distance (in points) between the actual exchange fill price and the
-# initial protective stop. Anchored to the REAL fill price reported by
-# Shark, never to TradingView's price - this is intentional per your spec.
 INITIAL_SL_POINTS = 100.0
-
-# Buffer between a stop's trigger price and its limit price for STOP_LIMIT
-# orders placed on Shark.
 STOP_LIMIT_BUFFER = 15.0
 
 
@@ -77,16 +71,6 @@ BOT_STATE = {
     "position_active": False
 }
 
-# -----------------------------------------------------------------------------
-# FIX 2: SL_WATCH holds the *live* stop/limit price each monitor thread should
-# be checking against. Previously monitor_stop_order() captured stop_price /
-# limit_price as plain function arguments at thread-start time, so a
-# successful in-place edit_stop_order() call (which keeps the same sl_id)
-# left the running monitor thread comparing live price against the OLD
-# buffer forever. Now the monitor thread re-reads this dict every loop
-# iteration, and any code path that changes a stop's price also updates the
-# dict, so the monitor is always working off the current exchange state.
-# -----------------------------------------------------------------------------
 SL_WATCH_LOCK = threading.Lock()
 SL_WATCH = {}
 
@@ -201,9 +185,7 @@ def sync_clock_directly() -> int:
         )
 
         if r.status_code == 200:
-
             res = r.json()
-
             srv_ts = int(
                 res.get("serverTime")
                 or res.get("data")
@@ -211,10 +193,7 @@ def sync_clock_directly() -> int:
             )
 
             if srv_ts > 0:
-                CLOCK_OFFSET_MS = (
-                    srv_ts - int(time.time() * 1000)
-                )
-
+                CLOCK_OFFSET_MS = srv_ts - int(time.time() * 1000)
                 return srv_ts
 
     except Exception:
@@ -227,35 +206,24 @@ def get_synced_time() -> int:
     global LAST_USED_TIMESTAMP
 
     with TS_LOCK:
-
-        now_ts = (
-            int(time.time() * 1000)
-            + CLOCK_OFFSET_MS
-        )
+        now_ts = int(time.time() * 1000) + CLOCK_OFFSET_MS
 
         if now_ts <= LAST_USED_TIMESTAMP:
             now_ts = LAST_USED_TIMESTAMP + 1
 
         LAST_USED_TIMESTAMP = now_ts
-
         return now_ts
 
 
 # =============================================================================
-# FASTAPI
+# FASTAPI LIFESPAN
 # =============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
     load_state()
     sync_clock_directly()
-
-    print(
-        f"[BOOT] Clock Offset = {CLOCK_OFFSET_MS}ms",
-        flush=True
-    )
-
+    print(f"[BOOT] Clock Offset = {CLOCK_OFFSET_MS}ms", flush=True)
     yield
 
 
@@ -267,7 +235,6 @@ app = FastAPI(lifespan=lifespan)
 # =============================================================================
 
 def clean_symbol(sym: str) -> str:
-
     if not sym:
         return DEFAULT_SYMBOL
 
@@ -283,7 +250,6 @@ def clean_symbol(sym: str) -> str:
 
 
 def sign_data(data_str: str) -> dict:
-
     sig = hmac.new(
         SHARK_API_SECRET.encode("utf-8"),
         data_str.encode("utf-8"),
@@ -303,12 +269,10 @@ def sign_data(data_str: str) -> dict:
 # =============================================================================
 
 def send_signed_order(payload: dict, max_retries: int = 3):
-
     for attempt in range(max_retries):
-
         if attempt > 0:
             sync_clock_directly()
-            time.sleep(0.10)
+            time.sleep(0.15)
 
         payload["timestamp"] = get_synced_time()
 
@@ -321,7 +285,6 @@ def send_signed_order(payload: dict, max_retries: int = 3):
         headers = sign_data(body)
 
         try:
-
             r = requests.post(
                 f"{SHARK_BASE_URL}/v1/order/place-order",
                 data=body,
@@ -330,38 +293,25 @@ def send_signed_order(payload: dict, max_retries: int = 3):
             )
 
             if r.status_code in [200, 201]:
-
                 res = r.json()
                 data = res.get("data", {})
 
-                if isinstance(data, dict):
-                    cid = (
-                        res.get("clientOrderId")
-                        or data.get("clientOrderId")
-                        or data.get("orderId")
-                    )
-                else:
-                    cid = (
-                        res.get("clientOrderId")
-                        or res.get("orderId")
-                    )
+                cid = (
+                    res.get("clientOrderId")
+                    or (data.get("clientOrderId") if isinstance(data, dict) else None)
+                    or (data.get("orderId") if isinstance(data, dict) else None)
+                    or res.get("orderId")
+                )
 
                 print(f"[ORDER SUCCESS] {res}", flush=True)
-
                 return True, cid
 
-            if (
-                r.status_code == 403
-                or "4007" in r.text
-                or "Signature mismatch" in r.text
-            ):
+            print(f"[EXCHANGE REJECTED] HTTP {r.status_code}: {r.text}", flush=True)
+
+            # Strict signature / clock drift retry check
+            if "4007" in r.text or "Signature mismatch" in r.text or "timestamp" in r.text.lower():
                 print(f"[SIGNATURE RETRY] Attempt {attempt + 1}", flush=True)
                 continue
-
-            print(
-                f"[EXCHANGE REJECTED] HTTP {r.status_code}: {r.text}",
-                flush=True
-            )
 
             return False, None
 
@@ -377,7 +327,6 @@ def send_signed_order(payload: dict, max_retries: int = 3):
 # =============================================================================
 
 def cancel_order(client_order_id: str) -> bool:
-
     if not client_order_id:
         return True
 
@@ -397,8 +346,9 @@ def cancel_order(client_order_id: str) -> bool:
             timeout=4
         )
 
-        if r.status_code in [200, 201, 204]:
-            print(f"[ORDER CANCELLED] {client_order_id}", flush=True)
+        # 3060 means order already completed/not active; treat as resolved
+        if r.status_code in [200, 201, 204] or "3060" in r.text or "not found" in r.text.lower():
+            print(f"[ORDER RESOLVED/CANCELLED] {client_order_id}", flush=True)
             return True
 
         print(f"[CANCEL FAILED] {r.status_code}: {r.text}", flush=True)
@@ -411,7 +361,6 @@ def cancel_order(client_order_id: str) -> bool:
 
 # =============================================================================
 # EDIT EXISTING STOP ORDER
-# Shark supports PATCH /v1/order/edit-order
 # =============================================================================
 
 def edit_stop_order(
@@ -420,7 +369,6 @@ def edit_stop_order(
     stop_price: float,
     limit_price: float
 ) -> bool:
-
     if not client_order_id:
         return False
 
@@ -464,7 +412,6 @@ def edit_stop_order(
 # =============================================================================
 
 def get_exchange_position_state(symbol: str):
-
     target = clean_symbol(symbol)
     ts = str(get_synced_time())
 
@@ -489,20 +436,27 @@ def get_exchange_position_state(symbol: str):
 
             res = r.json()
             data = res.get("data", res)
-            items = data if isinstance(data, list) else [data]
+
+            if isinstance(data, dict):
+                items = data.get("list") or data.get("positions") or [data]
+            elif isinstance(data, list):
+                items = data
+            else:
+                items = [data]
 
             for pos in items:
                 if not isinstance(pos, dict):
                     continue
 
-                sym = str(pos.get("symbol", "")).upper()
-                if target not in sym and sym not in target:
+                raw_sym = clean_symbol(str(pos.get("symbol", "")))
+                if target not in raw_sym and raw_sym not in target:
                     continue
 
                 raw_qty = float(
                     pos.get("positionAmt")
                     or pos.get("size")
                     or pos.get("positionAmount")
+                    or pos.get("total")
                     or 0.0
                 )
 
@@ -515,8 +469,6 @@ def get_exchange_position_state(symbol: str):
                         return abs(raw_qty), "SELL"
                     return abs(raw_qty), "BUY"
 
-                return 0.0, "FLAT"
-
         except Exception:
             continue
 
@@ -528,7 +480,6 @@ def get_exchange_position_state(symbol: str):
 # =============================================================================
 
 def wait_until_flat(symbol: str, timeout_sec: float = 5.0) -> bool:
-
     start = time.time()
 
     while time.time() - start < timeout_sec:
@@ -546,7 +497,6 @@ def wait_until_flat(symbol: str, timeout_sec: float = 5.0) -> bool:
 # =============================================================================
 
 def get_current_ticker_price(symbol: str) -> float:
-
     target = clean_symbol(symbol)
     ts = str(get_synced_time())
     query = f"symbol={target}&timestamp={ts}"
@@ -582,11 +532,6 @@ def place_stop_loss(
     stop_price: float,
     trade_id: int
 ):
-    """
-    side  = the SL order's own side (opposite of the position side)
-    qty   = position quantity being protected
-    """
-
     target = clean_symbol(symbol)
     offset = STOP_LIMIT_BUFFER
 
@@ -619,8 +564,6 @@ def place_stop_loss(
     if ok and cid:
         print(f"[STOP PLACED] ID={cid}", flush=True)
 
-        # FIX 2: register the live price this monitor thread should track,
-        # instead of baking it into the thread's arguments.
         register_sl_watch(cid, stop_price, limit_price, side, qty)
 
         threading.Thread(
@@ -636,14 +579,9 @@ def place_stop_loss(
 
 # =============================================================================
 # STOP MONITOR
-# FIX 2: no longer takes stop_price/limit_price/side/qty as fixed arguments.
-# Instead it re-reads SL_WATCH[sl_id] every loop iteration, so any code path
-# that edits the stop in place (edit_stop_order) can update the buffer this
-# thread checks against just by calling update_sl_watch().
 # =============================================================================
 
 def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
-
     target = clean_symbol(symbol)
     start = time.time()
 
@@ -651,16 +589,12 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
         time.sleep(0.8)
 
         with ENGINE_LOCK:
-            if BOT_STATE.get("trade_id") != trade_id:
-                remove_sl_watch(sl_id)
-                return
-            if BOT_STATE.get("sl_id") != sl_id:
+            if BOT_STATE.get("trade_id") != trade_id or BOT_STATE.get("sl_id") != sl_id:
                 remove_sl_watch(sl_id)
                 return
 
         watch = get_sl_watch(sl_id)
         if watch is None:
-            # Stop was cancelled/replaced elsewhere; nothing left to watch.
             return
 
         limit_price = watch["limit"]
@@ -668,7 +602,6 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
 
         live_qty, _ = get_exchange_position_state(target)
 
-        # Position is gone = SL (or something else) already executed.
         if live_qty <= 0.000001:
             with ENGINE_LOCK:
                 if BOT_STATE.get("trade_id") == trade_id:
@@ -684,8 +617,6 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
         if curr_price <= 0:
             continue
 
-        # Emergency protection for STOP_LIMIT gap - always checked against
-        # the CURRENT buffer, even if it was just moved by a trailing update.
         if sl_side == "SELL":
             breached = curr_price < limit_price
         else:
@@ -710,7 +641,6 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
             remove_sl_watch(sl_id)
             return
 
-        # Safety watchdog - just resets the loop timer, doesn't exit.
         if time.time() - start > 86400:
             print("[STOP MONITOR] 24h watchdog restart.", flush=True)
             start = time.time()
@@ -721,7 +651,6 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
 # =============================================================================
 
 def flatten_position(symbol: str, side: str, qty: float) -> bool:
-
     target = clean_symbol(symbol)
 
     if qty <= 0:
@@ -750,7 +679,6 @@ def flatten_position(symbol: str, side: str, qty: float) -> bool:
 # =============================================================================
 
 def check_order_status(client_order_id: str, symbol: str):
-
     target = clean_symbol(symbol)
     ts = str(get_synced_time())
     query = f"clientOrderId={client_order_id}&symbol={target}&timestamp={ts}"
@@ -767,18 +695,9 @@ def check_order_status(client_order_id: str, symbol: str):
             return "UNKNOWN", 0.0
 
         res = r.json()
-
-        # TEMP DEBUG - remove once Shark's order-detail schema is confirmed.
-        # This prints the raw response so we can see the exact field names
-        # this endpoint actually uses (place-order used orderAmount /
-        # filledAmount rather than the executedQty/status names originally
-        # assumed here).
-        print(f"[ORDER STATUS RAW] {res}", flush=True)
-
         order = res.get("data", res)
 
         if isinstance(order, dict):
-
             if "order" in order and isinstance(order["order"], dict):
                 order = order["order"]
 
@@ -789,10 +708,6 @@ def check_order_status(client_order_id: str, symbol: str):
                 or ""
             ).upper()
 
-            # Shark's place-order response uses orderAmount / filledAmount,
-            # not executedQty / cumQty / filledQty. Check both families of
-            # names so we're not blind to fills just because the status
-            # string is missing or spelled differently.
             order_amount = float(
                 order.get("orderAmount")
                 or order.get("quantity")
@@ -825,7 +740,6 @@ def check_order_status(client_order_id: str, symbol: str):
             if status in ["FILLED", "SUCCESS", "EXECUTED", "COMPLETE"]:
                 return "FILLED", avg_price
 
-            # No usable status string, but the amounts tell the real story.
             if order_amount > 0 and filled_amount >= order_amount * 0.999:
                 return "FILLED", avg_price
 
@@ -842,10 +756,6 @@ def check_order_status(client_order_id: str, symbol: str):
 
 # =============================================================================
 # ENTRY WATCHER
-# Waits up to timeout_sec for the limit entry to fill. Only once a fill is
-# confirmed does it read the REAL fill price from Shark and place the SL
-# INITIAL_SL_POINTS away from it. If it times out unfilled, the order is
-# simply cancelled - no SL is ever placed for an order that never filled.
 # =============================================================================
 
 def entry_order_watcher(
@@ -857,20 +767,16 @@ def entry_order_watcher(
     order_id: str,
     timeout_sec: int
 ):
-
     target = clean_symbol(symbol)
     start = time.time()
 
     print(f"[ENTRY WATCHER] ID={order_id} Timeout={timeout_sec}s", flush=True)
 
     while time.time() - start < timeout_sec:
-
         time.sleep(0.8)
 
         with ENGINE_LOCK:
-            if BOT_STATE.get("trade_id") != trade_id:
-                return
-            if BOT_STATE.get("entry_id") != order_id:
+            if BOT_STATE.get("trade_id") != trade_id or BOT_STATE.get("entry_id") != order_id:
                 return
 
         status, exec_price = check_order_status(order_id, target)
@@ -885,14 +791,6 @@ def entry_order_watcher(
             return
 
         filled_via_order_detail = status in ["FILLED", "PARTIAL"]
-
-        # -------------------------------------------------------------------
-        # BACKSTOP: check the live exchange position independently of
-        # check_order_status()'s parsing. If order-detail's field names are
-        # ever wrong again (as happened - Shark uses orderAmount/filledAmount,
-        # not executedQty/status), this still catches a real fill instead of
-        # silently timing out and cancelling an already-filled order.
-        # -------------------------------------------------------------------
         filled_via_backstop = False
 
         if not filled_via_order_detail:
@@ -900,21 +798,16 @@ def entry_order_watcher(
             if backstop_qty >= qty * 0.999 and backstop_side == side:
                 filled_via_backstop = True
                 print(
-                    f"[ENTRY WATCHER] Order-detail did not confirm, but "
-                    f"exchange shows a live {backstop_side} position "
-                    f"Qty={backstop_qty} - treating as FILLED via backstop.",
+                    f"[ENTRY WATCHER] Detected live position via backstop: "
+                    f"{backstop_side} Qty={backstop_qty}. Triggering stop placement.",
                     flush=True
                 )
 
         if filled_via_order_detail or filled_via_backstop:
-
             live_qty, live_side = get_exchange_position_state(target)
             if live_qty <= 0:
                 continue
 
-            # Real fill price from Shark order-detail when available;
-            # otherwise fall back to the current ticker price (backstop
-            # path), and only as a last resort to the requested limit price.
             if exec_price > 0:
                 real_fill = exec_price
             else:
@@ -963,9 +856,6 @@ def entry_order_watcher(
 
             return
 
-    # -------------------------------------------------------------------
-    # TIMEOUT: cancel the unfilled order, no SL is ever placed for it.
-    # -------------------------------------------------------------------
     print(f"[ENTRY TIMEOUT] Cancelling {order_id}", flush=True)
 
     with ENGINE_LOCK:
@@ -977,11 +867,7 @@ def entry_order_watcher(
 
 
 # =============================================================================
-# ENTRY PROCESSOR
-# FIX 1: in the reversal branch, the old stop is now only cancelled AFTER the
-# flatten is confirmed. If the flatten can't be confirmed within the wait
-# window, the function aborts WITHOUT touching the old stop - so the
-# original position is never left naked.
+# ENTRY SIGNAL HANDLER
 # =============================================================================
 
 def process_entry_signal(
@@ -992,28 +878,20 @@ def process_entry_signal(
     trade_id: int,
     timeout_sec: int
 ):
-
     target = clean_symbol(symbol)
     side = "BUY" if "BUY" in action else "SELL"
 
     with ENGINE_LOCK:
-
-        # ---------------------------------------------------------------
-        # Ignore stale/out-of-order alerts
-        # ---------------------------------------------------------------
         current_id = BOT_STATE.get("trade_id")
         if current_id is not None and trade_id < current_id:
             print(f"[OLD SIGNAL IGNORED] {trade_id} < {current_id}", flush=True)
             return
 
-        # ---------------------------------------------------------------
-        # Reverse an existing position, if the exchange actually has one
-        # ---------------------------------------------------------------
         live_qty, live_side = get_exchange_position_state(target)
 
+        # Handle Position Reversal
         if live_qty > 0 and live_side != side:
-
-            print(f"[REVERSAL] Closing {live_side} before {side}", flush=True)
+            print(f"[REVERSAL] Closing {live_side} before entering {side}", flush=True)
 
             opposite = "SELL" if live_side == "BUY" else "BUY"
             flatten_position(target, opposite, live_qty)
@@ -1021,35 +899,26 @@ def process_entry_signal(
             confirmed_flat = wait_until_flat(target, timeout_sec=5)
 
             if not confirmed_flat:
-                # FIX 1: do NOT touch the old sl_id here. The original
-                # position may still be open, so its protective stop must
-                # be left exactly as-is rather than cancelled.
                 print(
                     "[REVERSAL ABORTED] Old position did not confirm flat. "
-                    "Existing stop left in place for safety.",
+                    "Existing stop left in place.",
                     flush=True
                 )
                 return
 
-            # Flatten confirmed - now it's safe to clean up the old stop.
             if BOT_STATE.get("sl_id"):
                 cancel_order(BOT_STATE["sl_id"])
 
             purge_state()
 
-        # ---------------------------------------------------------------
-        # Cancel any old pending (unfilled) entry
-        # ---------------------------------------------------------------
+        # Cancel pending entry orders
         if BOT_STATE.get("entry_id"):
             cancel_order(BOT_STATE["entry_id"])
             BOT_STATE["entry_id"] = None
             BOT_STATE["entry_active"] = False
 
-        # ---------------------------------------------------------------
-        # If the exchange still shows a position, refuse to double-enter
-        # ---------------------------------------------------------------
+        # Verify not double entering
         live_qty, live_side = get_exchange_position_state(target)
-
         if live_qty > 0:
             print(
                 f"[ENTRY BLOCKED] Existing {live_side} position Qty={live_qty}",
@@ -1057,9 +926,6 @@ def process_entry_signal(
             )
             return
 
-        # ---------------------------------------------------------------
-        # New trade state
-        # ---------------------------------------------------------------
         BOT_STATE["trade_id"] = trade_id
         BOT_STATE["side"] = side
         BOT_STATE["qty"] = qty
@@ -1071,9 +937,6 @@ def process_entry_signal(
         BOT_STATE["position_active"] = False
         save_state()
 
-        # ---------------------------------------------------------------
-        # Place LIMIT entry
-        # ---------------------------------------------------------------
         clean_price = float(f"{price:.2f}")
         clean_qty = float(f"{qty:.4f}")
 
@@ -1110,18 +973,13 @@ def process_entry_signal(
 
 
 # =============================================================================
-# TRAILING SL
-# FIX 2: on a successful in-place edit, update_sl_watch() pushes the new
-# stop/limit into the shared dict so the already-running monitor thread
-# picks it up on its very next loop iteration - no stale price window.
+# TRAILING STOP SIGNAL
 # =============================================================================
 
 def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: int):
-
     target = clean_symbol(symbol)
 
     with ENGINE_LOCK:
-
         if BOT_STATE.get("trade_id") != trade_id:
             print("[UPDATE_SL IGNORED] Trade ID mismatch.", flush=True)
             return
@@ -1139,7 +997,6 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
 
         old_stop = float(BOT_STATE.get("sl_price") or 0.0)
 
-        # Never loosen the stop
         if live_side == "BUY":
             if old_stop > 0 and new_stop <= old_stop:
                 print("[UPDATE_SL IGNORED] BUY stop would move backwards.", flush=True)
@@ -1153,19 +1010,11 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
 
         old_sl_id = BOT_STATE.get("sl_id")
 
-        # -----------------------------------------------------------------
-        # Try editing the existing Shark stop first
-        # -----------------------------------------------------------------
         if old_sl_id:
-
             offset = STOP_LIMIT_BUFFER
             new_limit = round(new_stop - offset, 2) if sl_side == "SELL" else round(new_stop + offset, 2)
 
             if edit_stop_order(old_sl_id, live_qty, new_stop, new_limit):
-
-                # FIX 2: push the new price into SL_WATCH so the existing
-                # monitor thread for old_sl_id starts checking against it
-                # immediately - it does not need a new thread.
                 update_sl_watch(old_sl_id, stop_price=new_stop, limit_price=new_limit, qty=live_qty)
 
                 BOT_STATE["qty"] = live_qty
@@ -1175,15 +1024,11 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
                 print(f"[STOP UPDATED] {new_stop}", flush=True)
                 return
 
-            # Edit failed - fall back to cancel/recreate.
             print("[STOP EDIT FAILED] Using cancel/recreate fallback.", flush=True)
             cancel_order(old_sl_id)
             remove_sl_watch(old_sl_id)
             BOT_STATE["sl_id"] = None
 
-        # ---------------------------------------------------------------
-        # Recreate stop (also the path used when there was no old_sl_id)
-        # ---------------------------------------------------------------
         new_sl_id = place_stop_loss(target, sl_side, live_qty, new_stop, trade_id)
 
         if new_sl_id:
@@ -1203,9 +1048,7 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
 # =============================================================================
 
 def process_cancel_entry(symbol: str, trade_id: int):
-
     with ENGINE_LOCK:
-
         if BOT_STATE.get("trade_id") != trade_id:
             return
 
@@ -1220,17 +1063,12 @@ def process_cancel_entry(symbol: str, trade_id: int):
 
 # =============================================================================
 # CLOSE EVERYTHING
-# FIX 1: the SL is only cancelled AFTER the flatten is confirmed flat. If it
-# can't be confirmed, state is NOT purged and the SL is left in place, so a
-# failed close never results in a naked, untracked position.
 # =============================================================================
 
 def process_close(symbol: str):
-
     target = clean_symbol(symbol)
 
     with ENGINE_LOCK:
-
         if BOT_STATE.get("entry_id"):
             cancel_order(BOT_STATE["entry_id"])
 
@@ -1245,13 +1083,11 @@ def process_close(symbol: str):
             if not confirmed_flat:
                 print(
                     "[CLOSE ABORTED] Position did not confirm flat. "
-                    "Existing stop left in place; state NOT purged.",
+                    "Existing stop left in place.",
                     flush=True
                 )
                 return
 
-        # Only reached if there was nothing to flatten, or the flatten
-        # was confirmed - safe to remove the stop and clear state now.
         if BOT_STATE.get("sl_id"):
             cancel_order(BOT_STATE["sl_id"])
 
@@ -1259,7 +1095,7 @@ def process_close(symbol: str):
 
 
 # =============================================================================
-# WEBHOOK
+# WEBHOOK ENDPOINTS
 # =============================================================================
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -1269,7 +1105,6 @@ async def root():
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
-
     try:
         data = await request.json()
     except Exception:
@@ -1334,4 +1169,4 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+    uvicorn.run("shark_bridge:app", host="0.0.0.0", port=port)
