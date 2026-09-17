@@ -7,6 +7,7 @@ import socket
 import requests
 import threading
 
+from datetime import datetime
 from contextlib import asynccontextmanager
 
 import urllib3.util.connection as urllib3_cn
@@ -232,10 +233,57 @@ def sync_clock_directly() -> int:
 
                 return srv_ts
 
-    except Exception:
-        pass
+        # /v1/time is NOT in Pi42's documented public endpoint list
+        # (ticker24Hr, aggTrade, depth, klines, exchangeInfo are the only
+        # ones). If this consistently 404s/errors, CLOCK_OFFSET_MS has
+        # never actually been corrected here - update_clock_from_server_time()
+        # below (fed from real order responses) is the real fix.
+        print(
+            f"[CLOCK SYNC] /v1/time returned HTTP {r.status_code} "
+            f"(not a documented endpoint - may not exist)",
+            flush=True
+        )
+
+    except Exception as e:
+        print(f"[CLOCK SYNC ERROR] {e}", flush=True)
 
     return int(time.time() * 1000) + CLOCK_OFFSET_MS
+
+
+def update_clock_from_server_time(iso_time_str: str):
+    """
+    Derives CLOCK_OFFSET_MS from the "time" field Shark actually returns
+    on every successful order response (ISO 8601, e.g.
+    "2026-09-17T08:15:06.079Z") - this is real, confirmed-working data,
+    unlike the unverified /v1/time endpoint above. Called right after
+    every successful place-order response.
+    """
+    global CLOCK_OFFSET_MS
+
+    if not iso_time_str:
+        return
+
+    try:
+        # Handle the trailing "Z" (UTC) explicitly for Python's fromisoformat
+        cleaned = iso_time_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(cleaned)
+        srv_ts = int(dt.timestamp() * 1000)
+
+        local_ts = int(time.time() * 1000)
+        new_offset = srv_ts - local_ts
+
+        # Only log when it actually shifts meaningfully, to avoid spam
+        if abs(new_offset - CLOCK_OFFSET_MS) > 200:
+            print(
+                f"[CLOCK SYNC] Corrected via order response: "
+                f"offset {CLOCK_OFFSET_MS}ms -> {new_offset}ms",
+                flush=True
+            )
+
+        CLOCK_OFFSET_MS = new_offset
+
+    except Exception as e:
+        print(f"[CLOCK SYNC FROM ORDER ERROR] {e}", flush=True)
 
 
 def get_synced_time() -> int:
@@ -383,6 +431,10 @@ def send_signed_order(payload: dict, max_retries: int = 3):
                     )
 
                 print(f"[ORDER SUCCESS] {res}", flush=True)
+
+                # Correct clock offset from real, confirmed-working data
+                # instead of relying on the unverified /v1/time endpoint.
+                update_clock_from_server_time(res.get("time"))
 
                 return True, cid
 
