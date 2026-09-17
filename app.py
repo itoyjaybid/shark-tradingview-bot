@@ -90,6 +90,11 @@ BOT_STATE = {
 SL_WATCH_LOCK = threading.Lock()
 SL_WATCH = {}
 
+# Tracks which order IDs have already had their check_order_status() 404
+# logged once, so a permanently-broken endpoint doesn't spam identical
+# lines on every 0.8s poll for the whole entry-timeout window.
+ORDER_STATUS_FAIL_LOGGED = set()
+
 
 def register_sl_watch(sl_id: str, stop_price: float, limit_price: float, side: str, qty: float):
     with SL_WATCH_LOCK:
@@ -811,6 +816,15 @@ def check_order_status(client_order_id: str, symbol: str):
     was guessed and never worked, which is why fills were never being
     detected). Response fields per docs: status, filledQty (net filled),
     executedQty (last filled), avgPrice, quantity (order size).
+
+    NOTE: as of the last confirmed test, this documented endpoint itself
+    returns a framework-level 404 ("Cannot GET ...") on Shark's production
+    API, suggesting it isn't actually live there despite the docs. Fill
+    detection therefore currently relies on entry_order_watcher's
+    live-position backstop, which IS confirmed working. This function is
+    left in place in case Shark fixes/relocates the endpoint - only the
+    first failure per order is logged to avoid spamming identical 404s
+    every 0.8s for the whole polling window.
     """
 
     target = clean_symbol(symbol)
@@ -826,11 +840,14 @@ def check_order_status(client_order_id: str, symbol: str):
         )
 
         if r.status_code != 200:
-            print(
-                f"[ORDER STATUS FAILED] ID={client_order_id} -> "
-                f"HTTP {r.status_code}: {r.text}",
-                flush=True
-            )
+            if client_order_id not in ORDER_STATUS_FAIL_LOGGED:
+                print(
+                    f"[ORDER STATUS FAILED] ID={client_order_id} -> "
+                    f"HTTP {r.status_code}: {r.text} "
+                    f"(further identical failures for this order suppressed)",
+                    flush=True
+                )
+                ORDER_STATUS_FAIL_LOGGED.add(client_order_id)
             return "UNKNOWN", 0.0
 
         res = r.json()
