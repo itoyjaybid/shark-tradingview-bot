@@ -95,6 +95,16 @@ SL_WATCH = {}
 # lines on every 0.8s poll for the whole entry-timeout window.
 ORDER_STATUS_FAIL_LOGGED = set()
 
+# Throttled raw logging for get_exchange_position_state(): a *successful*
+# (HTTP 200) response that simply doesn't contain the position we expect
+# was previously invisible - only outright errors got logged. This prints
+# the raw response periodically (not every 0.8s poll) so an incident like
+# "exchange has an open position but our check reported FLAT" can actually
+# be diagnosed after the fact instead of leaving zero trace.
+POSITION_RAW_LOG_LOCK = threading.Lock()
+LAST_POSITION_RAW_LOG = 0.0
+POSITION_RAW_LOG_INTERVAL_SEC = 8.0
+
 
 def register_sl_watch(sl_id: str, stop_price: float, limit_price: float, side: str, qty: float):
     with SL_WATCH_LOCK:
@@ -535,6 +545,19 @@ def get_exchange_position_state(symbol: str):
             return 0.0, "FLAT", 0.0
 
         res = r.json()
+
+        # Throttled visibility into what a HEALTHY (200) response actually
+        # contains - this is what was missing when a real open position
+        # went undetected without any error being logged anywhere.
+        global LAST_POSITION_RAW_LOG
+        now = time.time()
+        with POSITION_RAW_LOG_LOCK:
+            should_log = (now - LAST_POSITION_RAW_LOG) >= POSITION_RAW_LOG_INTERVAL_SEC
+            if should_log:
+                LAST_POSITION_RAW_LOG = now
+        if should_log:
+            print(f"[POSITION RAW] target={target} -> {res}", flush=True)
+
         data = res if isinstance(res, list) else res.get("data", res)
         items = data if isinstance(data, list) else [data]
 
@@ -770,10 +793,29 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
                     BOT_STATE.get("sl_id") == sl_id
                     and BOT_STATE.get("trade_id") == trade_id
                 ):
-                    cancel_order(sl_id)
+                    # Flatten FIRST, before touching the existing stop. If
+                    # the market exit fails, the resting STOP_LIMIT is the
+                    # only protection this position has - cancelling it
+                    # first (as this used to do) would leave the position
+                    # completely naked on a failed flatten.
                     flatten_position(target, sl_side, live_qty)
-                    wait_until_flat(target, timeout_sec=5)
-                    purge_state()
+                    confirmed_flat = wait_until_flat(target, timeout_sec=5)
+
+                    if confirmed_flat:
+                        cancel_order(sl_id)
+                        purge_state()
+                    else:
+                        print(
+                            "[CRITICAL] Emergency flatten FAILED during "
+                            f"STOP GAP handling. Position (side={sl_side}, "
+                            f"qty={live_qty}) may still be open. Existing "
+                            "stop order left in place as a last line of "
+                            "defense; state NOT purged - MANUAL CHECK "
+                            "REQUIRED.",
+                            flush=True
+                        )
+                        remove_sl_watch(sl_id)
+                        return
 
             remove_sl_watch(sl_id)
             return
@@ -1046,8 +1088,19 @@ def entry_order_watcher(
                         flush=True
                     )
                     flatten_position(target, sl_side, live_qty)
-                    wait_until_flat(target, 5)
-                    purge_state()
+                    confirmed_flat = wait_until_flat(target, 5)
+
+                    if confirmed_flat:
+                        purge_state()
+                    else:
+                        print(
+                            "[CRITICAL] Emergency flatten FAILED after initial "
+                            f"SL failure. Position (side={live_side}, "
+                            f"qty={live_qty}) is still open with NO stop. "
+                            "State kept (not purged) - MANUAL INTERVENTION "
+                            "REQUIRED.",
+                            flush=True
+                        )
                     return
 
                 save_state()
@@ -1283,10 +1336,26 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
             save_state()
             print(f"[STOP UPDATED] {new_stop}", flush=True)
         else:
-            print("[CRITICAL] Unable to recreate SL.", flush=True)
+            print("[CRITICAL] Unable to recreate SL. Attempting emergency flatten.", flush=True)
             flatten_position(target, sl_side, live_qty)
-            wait_until_flat(target, 5)
-            purge_state()
+            confirmed_flat = wait_until_flat(target, 5)
+
+            if confirmed_flat:
+                purge_state()
+            else:
+                # The flatten failed too (as happened here - exchange
+                # rejected both attempts). The position is confirmed still
+                # open, so state must NOT be purged - doing so would make
+                # the bot forget about a live, unprotected position
+                # entirely, with nothing left watching it.
+                print(
+                    "[CRITICAL] Emergency flatten FAILED. Position is still "
+                    f"open on the exchange (side={sl_side and ('SELL' if sl_side == 'BUY' else 'BUY')}, "
+                    f"qty={live_qty}) with NO protective stop. State is "
+                    "being kept (not purged) so this isn't silently "
+                    "forgotten - MANUAL INTERVENTION REQUIRED.",
+                    flush=True
+                )
 
 
 # =============================================================================
