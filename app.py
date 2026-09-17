@@ -496,7 +496,13 @@ def get_exchange_position_state(symbol: str):
     Shark's actual API - those were guessed and never worked).
     Response fields per docs: contractPair (not symbol), positionType
     ("LONG"/"SHORT", not side/positionSide), positionAmount (already
-    unsigned - direction comes from positionType, not a negative sign).
+    unsigned - direction comes from positionType, not a negative sign),
+    entryPrice (the exchange's own recorded average entry price - this
+    is what the position UI's entry line actually shows, and should be
+    preferred over a ticker snapshot when calculating the initial SL).
+
+    Returns (qty, side, entry_price). Callers that don't need entry
+    price can unpack with `qty, side, _ = ...`.
     """
 
     target = clean_symbol(symbol)
@@ -526,7 +532,7 @@ def get_exchange_position_state(symbol: str):
                 f"HTTP {r.status_code}: {r.text}",
                 flush=True
             )
-            return 0.0, "FLAT"
+            return 0.0, "FLAT", 0.0
 
         res = r.json()
         data = res if isinstance(res, list) else res.get("data", res)
@@ -557,16 +563,18 @@ def get_exchange_position_state(symbol: str):
                 or ""
             ).upper()
 
+            entry_price = float(pos.get("entryPrice") or 0.0)
+
             if abs(raw_qty) > 0.000001:
                 if position_type in ["SHORT", "SELL"] or raw_qty < 0:
-                    return abs(raw_qty), "SELL"
-                return abs(raw_qty), "BUY"
+                    return abs(raw_qty), "SELL", entry_price
+                return abs(raw_qty), "BUY", entry_price
 
-        return 0.0, "FLAT"
+        return 0.0, "FLAT", 0.0
 
     except Exception as e:
         print(f"[POSITION CHECK ERROR] {endpoint} -> {e}", flush=True)
-        return 0.0, "FLAT"
+        return 0.0, "FLAT", 0.0
 
 
 # =============================================================================
@@ -578,12 +586,12 @@ def wait_until_flat(symbol: str, timeout_sec: float = 5.0) -> bool:
     start = time.time()
 
     while time.time() - start < timeout_sec:
-        qty, _ = get_exchange_position_state(symbol)
+        qty, _, _ = get_exchange_position_state(symbol)
         if qty <= 0.000001:
             return True
         time.sleep(0.20)
 
-    qty, _ = get_exchange_position_state(symbol)
+    qty, _, _ = get_exchange_position_state(symbol)
     return qty <= 0.000001
 
 
@@ -726,7 +734,7 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
         limit_price = watch["limit"]
         sl_side = watch["side"]
 
-        live_qty, _ = get_exchange_position_state(target)
+        live_qty, _, _ = get_exchange_position_state(target)
 
         # Position is gone = SL (or something else) already executed.
         if live_qty <= 0.000001:
@@ -969,7 +977,7 @@ def entry_order_watcher(
         filled_via_backstop = False
 
         if not filled_via_order_detail:
-            backstop_qty, backstop_side = get_exchange_position_state(target)
+            backstop_qty, backstop_side, _ = get_exchange_position_state(target)
             if backstop_qty >= qty * 0.999 and backstop_side == side:
                 filled_via_backstop = True
                 print(
@@ -981,21 +989,31 @@ def entry_order_watcher(
 
         if filled_via_order_detail or filled_via_backstop:
 
-            live_qty, live_side = get_exchange_position_state(target)
+            live_qty, live_side, live_entry_price = get_exchange_position_state(target)
             if live_qty <= 0:
                 continue
 
-            # Real fill price from Shark order-detail when available;
-            # otherwise fall back to the current ticker price (backstop
-            # path), and only as a last resort to the requested limit price.
+            # Real fill price, in priority order:
+            # 1. exec_price from order-detail, when that endpoint works
+            # 2. the exchange's own recorded position entryPrice - this is
+            #    what the position UI's entry line shows, and is exact
+            #    (not an approximation like the ticker snapshot below)
+            # 3. current ticker price, as a rough fallback
+            # 4. the originally requested limit price, as a last resort
             if exec_price > 0:
                 real_fill = exec_price
+                fill_source = "order-detail"
+            elif live_entry_price > 0:
+                real_fill = live_entry_price
+                fill_source = "position entryPrice"
             else:
                 ticker_price = get_current_ticker_price(target)
                 real_fill = ticker_price if ticker_price > 0 else limit_price
+                fill_source = "ticker" if ticker_price > 0 else "requested price (fallback)"
 
             print(
-                f"[ENTRY FILLED] {live_side} Qty={live_qty} Price={real_fill}",
+                f"[ENTRY FILLED] {live_side} Qty={live_qty} "
+                f"Price={real_fill} (source: {fill_source})",
                 flush=True
             )
 
@@ -1082,7 +1100,7 @@ def process_entry_signal(
         # ---------------------------------------------------------------
         # Reverse an existing position, if the exchange actually has one
         # ---------------------------------------------------------------
-        live_qty, live_side = get_exchange_position_state(target)
+        live_qty, live_side, _ = get_exchange_position_state(target)
 
         if live_qty > 0 and live_side != side:
 
@@ -1121,7 +1139,7 @@ def process_entry_signal(
         # ---------------------------------------------------------------
         # If the exchange still shows a position, refuse to double-enter
         # ---------------------------------------------------------------
-        live_qty, live_side = get_exchange_position_state(target)
+        live_qty, live_side, _ = get_exchange_position_state(target)
 
         if live_qty > 0:
             print(
@@ -1199,7 +1217,7 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
             print("[UPDATE_SL IGNORED] Trade ID mismatch.", flush=True)
             return
 
-        live_qty, live_side = get_exchange_position_state(target)
+        live_qty, live_side, _ = get_exchange_position_state(target)
 
         if live_qty <= 0:
             print("[UPDATE_SL] Exchange position is flat.", flush=True)
@@ -1307,7 +1325,7 @@ def process_close(symbol: str):
         if BOT_STATE.get("entry_id"):
             cancel_order(BOT_STATE["entry_id"])
 
-        live_qty, live_side = get_exchange_position_state(target)
+        live_qty, live_side, _ = get_exchange_position_state(target)
 
         if live_qty > 0:
             opposite = "SELL" if live_side == "BUY" else "BUY"
