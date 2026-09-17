@@ -443,7 +443,13 @@ def send_signed_order(payload: dict, max_retries: int = 3):
                 or "4007" in r.text
                 or "Signature mismatch" in r.text
             ):
-                print(f"[SIGNATURE RETRY] Attempt {attempt + 1}", flush=True)
+                print(
+                    f"[SIGNATURE RETRY] Attempt {attempt + 1} -> "
+                    f"HTTP {r.status_code}: {r.text} | "
+                    f"timestamp_used={payload.get('timestamp')} "
+                    f"clock_offset_ms={CLOCK_OFFSET_MS}",
+                    flush=True
+                )
                 continue
 
             print(
@@ -457,6 +463,12 @@ def send_signed_order(payload: dict, max_retries: int = 3):
             print(f"[DISPATCH ERROR] {e}", flush=True)
             time.sleep(0.10)
 
+    print(
+        f"[SIGNATURE RETRY EXHAUSTED] All {max_retries} attempts failed "
+        f"with signature mismatch. Order NOT placed. "
+        f"Final clock_offset_ms={CLOCK_OFFSET_MS}",
+        flush=True
+    )
     return False, None
 
 
