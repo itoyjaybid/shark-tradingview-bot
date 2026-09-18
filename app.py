@@ -1172,12 +1172,81 @@ def entry_order_watcher(
             return
 
     # -------------------------------------------------------------------
-    # TIMEOUT: cancel the unfilled order, no SL is ever placed for it.
+    # TIMEOUT: cancel the unfilled order.
+    #
+    # RACE CONDITION HANDLING: if price reaches the entry level in the
+    # same narrow window this timeout fires, the exchange may fill the
+    # order microseconds before it processes our cancel - in which case
+    # cancel_order() fails with "order not found" (it already executed).
+    # Previously this was treated as a no-op and the fill went completely
+    # unprotected (no SL ever placed). Now, a failed cancel triggers a
+    # real position check before giving up.
     # -------------------------------------------------------------------
     print(f"[ENTRY TIMEOUT] Cancelling {order_id}", flush=True)
 
     with ENGINE_LOCK:
-        cancel_order(order_id)
+
+        if BOT_STATE.get("trade_id") != trade_id:
+            return
+
+        cancel_ok = cancel_order(order_id)
+
+        if not cancel_ok:
+            live_qty, live_side, live_entry_price = get_exchange_position_state(target)
+
+            if live_qty >= qty * 0.999 and live_side == side:
+                print(
+                    f"[ENTRY TIMEOUT RACE] Cancel failed AND the exchange "
+                    f"shows a live {live_side} position Qty={live_qty} - "
+                    f"the order filled right at the timeout boundary. "
+                    f"Treating as a normal fill and placing SL.",
+                    flush=True
+                )
+
+                real_fill = live_entry_price if live_entry_price > 0 else limit_price
+
+                BOT_STATE["side"] = live_side
+                BOT_STATE["qty"] = live_qty
+                BOT_STATE["fill_price"] = real_fill
+                BOT_STATE["entry_id"] = None
+                BOT_STATE["entry_active"] = False
+                BOT_STATE["position_active"] = True
+
+                if live_side == "BUY":
+                    initial_stop = round(real_fill - INITIAL_SL_POINTS, 2)
+                    sl_side = "SELL"
+                else:
+                    initial_stop = round(real_fill + INITIAL_SL_POINTS, 2)
+                    sl_side = "BUY"
+
+                sl_id = place_stop_loss(target, sl_side, live_qty, initial_stop, trade_id)
+
+                if sl_id:
+                    BOT_STATE["sl_id"] = sl_id
+                    BOT_STATE["sl_price"] = initial_stop
+                    save_state()
+                else:
+                    print(
+                        "[CRITICAL] Initial SL FAILED after timeout-race "
+                        "fill. Attempting MARKET EXIT.",
+                        flush=True
+                    )
+                    flatten_position(target, sl_side, live_qty)
+                    confirmed_flat = wait_until_flat(target, 5)
+
+                    if confirmed_flat:
+                        purge_state()
+                    else:
+                        print(
+                            "[CRITICAL] Emergency flatten FAILED after "
+                            "timeout-race fill. Position may still be "
+                            "open with NO stop. State kept (not purged) "
+                            "- MANUAL INTERVENTION REQUIRED.",
+                            flush=True
+                        )
+
+                return
+
         if BOT_STATE.get("entry_id") == order_id:
             BOT_STATE["entry_id"] = None
             BOT_STATE["entry_active"] = False
