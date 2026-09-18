@@ -106,6 +106,16 @@ POSITION_RAW_LOG_LOCK = threading.Lock()
 LAST_POSITION_RAW_LOG = 0.0
 POSITION_RAW_LOG_INTERVAL_SEC = 8.0
 
+# Persistent stop-update retry state: when a trailing SL update fails on
+# its first attempt (e.g. the intermittent signature-mismatch issue),
+# PENDING_SL[trade_id] holds the target stop price a background retry
+# loop keeps chasing until it succeeds, is superseded, or the position
+# closes - so a transient failure never just gets silently skipped until
+# whenever the next unrelated signal happens to arrive.
+PENDING_SL_LOCK = threading.Lock()
+PENDING_SL = {}
+RETRY_THREAD_ACTIVE = set()
+
 
 def register_sl_watch(sl_id: str, stop_price: float, limit_price: float, side: str, qty: float):
     with SL_WATCH_LOCK:
@@ -1393,6 +1403,150 @@ def process_entry_signal(
 # picks it up on its very next loop iteration - no stale price window.
 # =============================================================================
 
+def attempt_stop_update(target: str, sl_side: str, live_qty: float, new_stop: float, trade_id: int) -> bool:
+    """
+    Tries to move the protective stop to new_stop. Must be called while
+    holding ENGINE_LOCK. Reads the CURRENT old_sl_id/old_stop_price from
+    BOT_STATE fresh on every call, so retries always act on the real
+    current state rather than a stale snapshot.
+
+    Ordering is deliberate: the replacement is always placed/confirmed
+    BEFORE the old stop is touched, so a failed attempt never leaves the
+    position with less protection than it had going in.
+
+    Returns True if the stop is now at new_stop, False otherwise (in
+    which case whatever stop existed before is untouched and still
+    valid).
+    """
+
+    old_sl_id = BOT_STATE.get("sl_id")
+    old_stop_price = BOT_STATE.get("sl_price")
+
+    if old_sl_id:
+
+        offset = STOP_LIMIT_BUFFER
+        new_limit = round(new_stop - offset, 2) if sl_side == "SELL" else round(new_stop + offset, 2)
+
+        if edit_stop_order(old_sl_id, live_qty, new_stop, new_limit):
+            update_sl_watch(old_sl_id, stop_price=new_stop, limit_price=new_limit, qty=live_qty)
+            BOT_STATE["qty"] = live_qty
+            BOT_STATE["sl_price"] = new_stop
+            save_state()
+            print(f"[STOP UPDATED] {new_stop}", flush=True)
+            return True
+
+        new_sl_id = place_stop_loss(target, sl_side, live_qty, new_stop, trade_id)
+
+        if new_sl_id:
+            cancel_order(old_sl_id)
+            remove_sl_watch(old_sl_id)
+            BOT_STATE["sl_id"] = new_sl_id
+            BOT_STATE["sl_price"] = new_stop
+            save_state()
+            print(f"[STOP UPDATED] {new_stop}", flush=True)
+            return True
+
+        print(
+            f"[STOP UPDATE FAILED] Could not place replacement stop at "
+            f"{new_stop}. Old stop at {old_stop_price} (ID={old_sl_id}) "
+            f"LEFT IN PLACE as continued protection.",
+            flush=True
+        )
+        return False
+
+    # No existing stop at all - only here does a failure mean genuinely
+    # zero protection, since there was nothing to fall back on.
+    new_sl_id = place_stop_loss(target, sl_side, live_qty, new_stop, trade_id)
+
+    if new_sl_id:
+        BOT_STATE["sl_id"] = new_sl_id
+        BOT_STATE["sl_price"] = new_stop
+        save_state()
+        print(f"[STOP UPDATED] {new_stop}", flush=True)
+        return True
+
+    print("[CRITICAL] No stop existed and placement failed.", flush=True)
+    return False
+
+
+def sl_update_retry_loop(symbol: str, trade_id: int):
+    """
+    Persistently retries a trailing-stop update that failed on its first
+    attempt, with backoff, until it either succeeds, is superseded by a
+    newer target (PENDING_SL updated again), or the position closes.
+
+    This exists because Pine only sends UPDATE_SL when a new swing forms
+    or profit-lock triggers - not on a timer. If a single failed attempt
+    were simply skipped, the stop could sit stale for a long time while
+    price moves hundreds of points further, turning a brief transient
+    failure into a large, avoidable loss.
+    """
+
+    target = clean_symbol(symbol)
+    backoffs = [2, 3, 5, 8, 13, 20, 30]
+    attempt = 0
+
+    while True:
+        wait_s = backoffs[min(attempt, len(backoffs) - 1)]
+        attempt += 1
+        time.sleep(wait_s)
+
+        with PENDING_SL_LOCK:
+            pending_stop = PENDING_SL.get(trade_id)
+        if pending_stop is None:
+            break  # nothing left to chase - succeeded or superseded elsewhere
+
+        with ENGINE_LOCK:
+            if BOT_STATE.get("trade_id") != trade_id:
+                break
+
+            live_qty, live_side, _ = get_exchange_position_state(target)
+            if live_qty <= 0:
+                print(
+                    f"[STOP RETRY] Position for trade {trade_id} is flat - "
+                    f"stopping retry loop.",
+                    flush=True
+                )
+                purge_state()
+                break
+
+            sl_side = "SELL" if live_side == "BUY" else "BUY"
+
+            # Re-read the pending target inside the lock in case a newer
+            # signal updated it between the check above and now.
+            with PENDING_SL_LOCK:
+                pending_stop = PENDING_SL.get(trade_id)
+            if pending_stop is None:
+                break
+
+            print(
+                f"[STOP RETRY] Attempt for trade {trade_id}, "
+                f"target={pending_stop} (retry #{attempt})",
+                flush=True
+            )
+
+            success = attempt_stop_update(target, sl_side, live_qty, pending_stop, trade_id)
+
+            if success:
+                with PENDING_SL_LOCK:
+                    # Only clear if nobody set an even newer target while
+                    # this attempt was in flight.
+                    if PENDING_SL.get(trade_id) == pending_stop:
+                        PENDING_SL.pop(trade_id, None)
+                print(
+                    f"[STOP RETRY SUCCESS] Trade {trade_id} stop is now "
+                    f"at {pending_stop}.",
+                    flush=True
+                )
+
+        with PENDING_SL_LOCK:
+            if trade_id not in PENDING_SL:
+                break
+
+    with PENDING_SL_LOCK:
+        RETRY_THREAD_ACTIVE.discard(trade_id)
+
+
 def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: int):
 
     target = clean_symbol(symbol)
@@ -1428,67 +1582,42 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
                 return
             sl_side = "BUY"
 
-        old_sl_id = BOT_STATE.get("sl_id")
+        success = attempt_stop_update(target, sl_side, live_qty, new_stop, trade_id)
 
-        # -----------------------------------------------------------------
-        # Try editing the existing Shark stop first
-        # -----------------------------------------------------------------
-        if old_sl_id:
+        if success:
+            with PENDING_SL_LOCK:
+                # A direct success supersedes any earlier failed target
+                # for this trade - nothing further to retry toward.
+                PENDING_SL.pop(trade_id, None)
+            return
 
-            offset = STOP_LIMIT_BUFFER
-            new_limit = round(new_stop - offset, 2) if sl_side == "SELL" else round(new_stop + offset, 2)
+        # First attempt failed. Register this as the target to keep
+        # chasing, and spawn a background retry loop if one isn't
+        # already running for this trade.
+        need_spawn = False
+        with PENDING_SL_LOCK:
+            PENDING_SL[trade_id] = new_stop
+            if trade_id not in RETRY_THREAD_ACTIVE:
+                RETRY_THREAD_ACTIVE.add(trade_id)
+                need_spawn = True
 
-            if edit_stop_order(old_sl_id, live_qty, new_stop, new_limit):
-
-                # FIX 2: push the new price into SL_WATCH so the existing
-                # monitor thread for old_sl_id starts checking against it
-                # immediately - it does not need a new thread.
-                update_sl_watch(old_sl_id, stop_price=new_stop, limit_price=new_limit, qty=live_qty)
-
-                BOT_STATE["qty"] = live_qty
-                BOT_STATE["sl_price"] = new_stop
-                save_state()
-
-                print(f"[STOP UPDATED] {new_stop}", flush=True)
-                return
-
-            # Edit failed - fall back to cancel/recreate.
-            print("[STOP EDIT FAILED] Using cancel/recreate fallback.", flush=True)
-            cancel_order(old_sl_id)
-            remove_sl_watch(old_sl_id)
-            BOT_STATE["sl_id"] = None
-
-        # ---------------------------------------------------------------
-        # Recreate stop (also the path used when there was no old_sl_id)
-        # ---------------------------------------------------------------
-        new_sl_id = place_stop_loss(target, sl_side, live_qty, new_stop, trade_id)
-
-        if new_sl_id:
-            BOT_STATE["sl_id"] = new_sl_id
-            BOT_STATE["sl_price"] = new_stop
-            save_state()
-            print(f"[STOP UPDATED] {new_stop}", flush=True)
+        if need_spawn:
+            print(
+                f"[STOP RETRY] Starting background retry loop for trade "
+                f"{trade_id}, target={new_stop}.",
+                flush=True
+            )
+            threading.Thread(
+                target=sl_update_retry_loop,
+                args=(target, trade_id),
+                daemon=True
+            ).start()
         else:
-            print("[CRITICAL] Unable to recreate SL. Attempting emergency flatten.", flush=True)
-            flatten_position(target, sl_side, live_qty)
-            confirmed_flat = wait_until_flat(target, 5)
-
-            if confirmed_flat:
-                purge_state()
-            else:
-                # The flatten failed too (as happened here - exchange
-                # rejected both attempts). The position is confirmed still
-                # open, so state must NOT be purged - doing so would make
-                # the bot forget about a live, unprotected position
-                # entirely, with nothing left watching it.
-                print(
-                    "[CRITICAL] Emergency flatten FAILED. Position is still "
-                    f"open on the exchange (side={sl_side and ('SELL' if sl_side == 'BUY' else 'BUY')}, "
-                    f"qty={live_qty}) with NO protective stop. State is "
-                    "being kept (not purged) so this isn't silently "
-                    "forgotten - MANUAL INTERVENTION REQUIRED.",
-                    flush=True
-                )
+            print(
+                f"[STOP RETRY] Updated pending target for trade "
+                f"{trade_id} to {new_stop} (retry loop already running).",
+                flush=True
+            )
 
 
 # =============================================================================
