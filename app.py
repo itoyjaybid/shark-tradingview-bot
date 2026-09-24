@@ -448,8 +448,9 @@ def get_current_ticker_price(symbol: str) -> float:
 
 def check_order_status(client_order_id: str, symbol: str):
     """
-    Uses the documented Shark endpoint: POST /v1/order/get-multiple
-    Eliminates the 404 from the non-existent GET /v1/order/{id} endpoint.
+    Queries POST /v1/order/get-multiple.
+    Accepts 200 OK and 201 Created.
+    Extracts status, leveragedQty, cumQty, and avgPrice.
     """
     payload = {
         "clientOrderIds": [str(client_order_id)],
@@ -465,7 +466,7 @@ def check_order_status(client_order_id: str, symbol: str):
             headers=headers,
             timeout=3
         )
-        if r.status_code != 200:
+        if r.status_code not in [200, 201]:
             if client_order_id not in ORDER_STATUS_FAIL_LOGGED:
                 print(
                     f"[ORDER STATUS FAILED] ID={client_order_id} -> HTTP {r.status_code}: {r.text}",
@@ -485,14 +486,26 @@ def check_order_status(client_order_id: str, symbol: str):
             if status in ["FILLED", "SUCCESS", "EXECUTED", "COMPLETE"]:
                 return "FILLED", avg_price
 
-            order_amount = float(order.get("quantity") or 0.0)
-            filled_amount = float(order.get("filledQty") or order.get("executedQty") or 0.0)
+            order_amount = float(
+                order.get("leveragedQty")
+                or order.get("quantity")
+                or order.get("orderAmount")
+                or 0.0
+            )
+            filled_amount = float(
+                order.get("cumQty")
+                or order.get("filledQty")
+                or order.get("executedQty")
+                or order.get("filledAmount")
+                or 0.0
+            )
 
             if order_amount > 0 and filled_amount >= order_amount * 0.999:
                 return "FILLED", avg_price
             if filled_amount > 0:
                 return "PARTIAL", avg_price
 
+            # NEW or OPEN signifies an active resting limit order
             return "OPEN", 0.0
     except Exception as e:
         print(f"[ORDER STATUS ERROR] {e}", flush=True)
