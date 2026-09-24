@@ -158,11 +158,6 @@ def purge_state():
 # =============================================================================
 
 def sync_clock_directly() -> int:
-    """
-    Shark Exchange doesn't expose /v1/time.
-    We calibrate against the HTTP 'Date' header returned by the documented
-    public ticker endpoint (/v1/market/ticker24Hr/{pair}).
-    """
     global CLOCK_OFFSET_MS
     try:
         r = requests.get(f"{SHARK_BASE_URL}/v1/market/ticker24Hr/btcusdt", timeout=2)
@@ -239,12 +234,6 @@ def clean_symbol(sym: str) -> str:
 # =============================================================================
 
 def send_signed_order(payload: dict, max_retries: int = 3):
-    """
-    Sends order to POST /v1/order/place-order matching Shark Docs:
-    - timestamp is a STRING
-    - json.dumps WITHOUT sort_keys=True
-    - separators=(',', ':')
-    """
     for attempt in range(max_retries):
         if attempt > 0:
             sync_clock_directly()
@@ -459,19 +448,20 @@ def get_current_ticker_price(symbol: str) -> float:
 
 def check_order_status(client_order_id: str, symbol: str):
     """
-    Queries GET /v1/order/{client_order_id}?timestamp=...
+    Uses the documented Shark endpoint: POST /v1/order/get-multiple
+    Eliminates the 404 from the non-existent GET /v1/order/{id} endpoint.
     """
-    ts = str(get_synced_time())
-    query = f"timestamp={ts}"
-    headers = {
-        "api-key": SHARK_API_KEY,
-        "signature": generate_signature(SHARK_API_SECRET, query),
-        "accept": "*/*"
+    payload = {
+        "clientOrderIds": [str(client_order_id)],
+        "timestamp": str(get_synced_time())
     }
+    data_to_sign = json.dumps(payload, separators=(',', ':'))
+    headers = sign_data(data_to_sign)
 
     try:
-        r = requests.get(
-            f"{SHARK_BASE_URL}/v1/order/{client_order_id}?{query}",
+        r = requests.post(
+            f"{SHARK_BASE_URL}/v1/order/get-multiple",
+            data=data_to_sign,
             headers=headers,
             timeout=3
         )
@@ -484,8 +474,9 @@ def check_order_status(client_order_id: str, symbol: str):
                 ORDER_STATUS_FAIL_LOGGED.add(client_order_id)
             return "UNKNOWN", 0.0
 
-        order = r.json()
-        if isinstance(order, dict):
+        orders = r.json()
+        if isinstance(orders, list) and len(orders) > 0:
+            order = orders[0]
             status = str(order.get("status") or "").upper()
             avg_price = float(order.get("avgPrice") or order.get("price") or 0.0)
 
@@ -494,8 +485,8 @@ def check_order_status(client_order_id: str, symbol: str):
             if status in ["FILLED", "SUCCESS", "EXECUTED", "COMPLETE"]:
                 return "FILLED", avg_price
 
-            order_amount = float(order.get("quantity") or order.get("orderAmount") or 0.0)
-            filled_amount = float(order.get("filledQty") or order.get("executedQty") or order.get("filledAmount") or 0.0)
+            order_amount = float(order.get("quantity") or 0.0)
+            filled_amount = float(order.get("filledQty") or order.get("executedQty") or 0.0)
 
             if order_amount > 0 and filled_amount >= order_amount * 0.999:
                 return "FILLED", avg_price
