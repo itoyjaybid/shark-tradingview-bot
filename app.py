@@ -160,7 +160,7 @@ def purge_state():
 def sync_clock_directly() -> int:
     global CLOCK_OFFSET_MS
     try:
-        r = requests.get(f"{SHARK_BASE_URL}/v1/market/ticker24Hr/btcusdt", timeout=2)
+        r = requests.get(f"{SHARK_BASE_URL}/v1/market/ticker24Hr/btcusdt", timeout=3)
         if "Date" in r.headers:
             server_dt = parsedate_to_datetime(r.headers["Date"])
             server_ts = int(server_dt.timestamp() * 1000)
@@ -350,6 +350,10 @@ def edit_stop_order(
 # =============================================================================
 
 def get_exchange_position_state(symbol: str):
+    """
+    Returns (quantity: float, side: str, entry_price: float)
+    Returns (None, "ERROR", None) on network timeout/failure so caller DOES NOT assume flat!
+    """
     target = clean_symbol(symbol)
     ts = str(get_synced_time())
 
@@ -369,10 +373,10 @@ def get_exchange_position_state(symbol: str):
     endpoint = f"/v1/positions/OPEN?{query_string}"
 
     try:
-        r = requests.get(f"{SHARK_BASE_URL}{endpoint}", headers=headers, timeout=3)
+        r = requests.get(f"{SHARK_BASE_URL}{endpoint}", headers=headers, timeout=5)
         if r.status_code != 200:
             print(f"[POSITION CHECK FAILED] HTTP {r.status_code}: {r.text}", flush=True)
-            return 0.0, "FLAT", 0.0
+            return None, "ERROR", None
 
         res = r.json()
 
@@ -419,17 +423,17 @@ def get_exchange_position_state(symbol: str):
         return 0.0, "FLAT", 0.0
     except Exception as e:
         print(f"[POSITION CHECK ERROR] {e}", flush=True)
-        return 0.0, "FLAT", 0.0
+        return None, "ERROR", None
 
 def wait_until_flat(symbol: str, timeout_sec: float = 5.0) -> bool:
     start = time.time()
     while time.time() - start < timeout_sec:
         qty, _, _ = get_exchange_position_state(symbol)
-        if qty <= 0.000001:
+        if qty is not None and qty <= 0.000001:
             return True
-        time.sleep(0.20)
+        time.sleep(0.25)
     qty, _, _ = get_exchange_position_state(symbol)
-    return qty <= 0.000001
+    return qty is not None and qty <= 0.000001
 
 def get_current_ticker_price(symbol: str) -> float:
     pair = clean_symbol(symbol).lower()
@@ -464,7 +468,7 @@ def check_order_status(client_order_id: str, symbol: str):
             f"{SHARK_BASE_URL}/v1/order/get-multiple",
             data=data_to_sign,
             headers=headers,
-            timeout=3
+            timeout=4
         )
         if r.status_code not in [200, 201]:
             if client_order_id not in ORDER_STATUS_FAIL_LOGGED:
@@ -505,7 +509,6 @@ def check_order_status(client_order_id: str, symbol: str):
             if filled_amount > 0:
                 return "PARTIAL", avg_price
 
-            # NEW or OPEN signifies an active resting limit order
             return "OPEN", 0.0
     except Exception as e:
         print(f"[ORDER STATUS ERROR] {e}", flush=True)
@@ -572,6 +575,10 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
         limit_price = watch["limit"]
         sl_side = watch["side"]
         live_qty, _, _ = get_exchange_position_state(target)
+
+        # CRITICAL FIX: If network error/timeout, live_qty is None -> DO NOT assume flat!
+        if live_qty is None:
+            continue
 
         if live_qty <= 0.000001:
             with ENGINE_LOCK:
@@ -653,12 +660,12 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
 
         if not filled_via_order_detail:
             backstop_qty, backstop_side, _ = get_exchange_position_state(target)
-            if backstop_qty >= qty * 0.999 and backstop_side == side:
+            if backstop_qty is not None and backstop_qty >= qty * 0.999 and backstop_side == side:
                 filled_via_backstop = True
 
         if filled_via_order_detail or filled_via_backstop:
             live_qty, live_side, live_entry_price = get_exchange_position_state(target)
-            if live_qty <= 0:
+            if live_qty is None or live_qty <= 0:
                 continue
 
             real_fill = exec_price if exec_price > 0 else (live_entry_price if live_entry_price > 0 else limit_price)
@@ -704,7 +711,7 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
         cancel_ok = cancel_order(order_id)
         if not cancel_ok:
             live_qty, live_side, live_entry_price = get_exchange_position_state(target)
-            if live_qty >= qty * 0.999 and live_side == side:
+            if live_qty is not None and live_qty >= qty * 0.999 and live_side == side:
                 real_fill = live_entry_price if live_entry_price > 0 else limit_price
                 BOT_STATE["side"] = live_side
                 BOT_STATE["qty"] = live_qty
@@ -738,7 +745,7 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
             return
 
         live_qty, live_side, _ = get_exchange_position_state(target)
-        if live_qty > 0 and live_side != side:
+        if live_qty is not None and live_qty > 0 and live_side != side:
             print(f"[REVERSAL] Closing {live_side} before {side}", flush=True)
             opposite = "SELL" if live_side == "BUY" else "BUY"
             flatten_position(target, opposite, live_qty)
@@ -757,7 +764,7 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
             BOT_STATE["entry_active"] = False
 
         live_qty, live_side, _ = get_exchange_position_state(target)
-        if live_qty > 0:
+        if live_qty is not None and live_qty > 0:
             print(f"[ENTRY BLOCKED] Existing position active: {live_side} {live_qty}", flush=True)
             return
 
@@ -862,17 +869,18 @@ def sl_update_retry_loop(symbol: str, trade_id: int):
                 break
 
             live_qty, live_side, _ = get_exchange_position_state(target)
-            if live_qty <= 0:
+            if live_qty is not None and live_qty <= 0:
                 purge_state()
                 break
 
-            sl_side = "SELL" if live_side == "BUY" else "BUY"
-            success = attempt_stop_update(target, sl_side, live_qty, pending_stop, trade_id)
-            if success:
-                with PENDING_SL_LOCK:
-                    if PENDING_SL.get(trade_id) == pending_stop:
-                        PENDING_SL.pop(trade_id, None)
-                break
+            if live_qty is not None and live_qty > 0:
+                sl_side = "SELL" if live_side == "BUY" else "BUY"
+                success = attempt_stop_update(target, sl_side, live_qty, pending_stop, trade_id)
+                if success:
+                    with PENDING_SL_LOCK:
+                        if PENDING_SL.get(trade_id) == pending_stop:
+                            PENDING_SL.pop(trade_id, None)
+                    break
 
         with PENDING_SL_LOCK:
             if trade_id not in PENDING_SL:
@@ -889,8 +897,11 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
             return
 
         live_qty, live_side, _ = get_exchange_position_state(target)
-        if live_qty <= 0:
+        if live_qty is not None and live_qty <= 0:
             purge_state()
+            return
+
+        if live_qty is None:
             return
 
         new_stop = float(f"{sl_price:.2f}")
@@ -941,7 +952,7 @@ def process_close(symbol: str):
             cancel_order(BOT_STATE["entry_id"])
 
         live_qty, live_side, _ = get_exchange_position_state(target)
-        if live_qty > 0:
+        if live_qty is not None and live_qty > 0:
             opposite = "SELL" if live_side == "BUY" else "BUY"
             flatten_position(target, opposite, live_qty)
             if not wait_until_flat(target, timeout_sec=5):
