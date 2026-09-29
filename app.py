@@ -44,6 +44,7 @@ TS_LOCK = threading.Lock()
 
 LAST_USED_TIMESTAMP = 0
 CLOCK_OFFSET_MS = 0
+LAST_API_CALL_TIME = 0.0
 
 INITIAL_SL_POINTS = 100.0
 STOP_LIMIT_BUFFER = 15.0
@@ -234,10 +235,12 @@ def clean_symbol(sym: str) -> str:
 # =============================================================================
 
 def send_signed_order(payload: dict, max_retries: int = 3):
+    global LAST_API_CALL_TIME
+
     for attempt in range(max_retries):
         if attempt > 0:
             sync_clock_directly()
-            time.sleep(0.15)
+            time.sleep(0.12)
 
         payload["timestamp"] = str(get_synced_time())
         data_to_sign = json.dumps(payload, separators=(',', ':'))
@@ -250,6 +253,7 @@ def send_signed_order(payload: dict, max_retries: int = 3):
                 headers=headers,
                 timeout=4
             )
+            LAST_API_CALL_TIME = time.time()
 
             if r.status_code in [200, 201]:
                 res = r.json()
@@ -319,9 +323,9 @@ def edit_stop_order(
     params = {
         "clientOrderId": str(client_order_id),
         "timestamp": str(get_synced_time()),
-        "quantity": float(f"{quantity:.4f}"),
-        "stopPrice": float(f"{stop_price:.2f}"),
-        "price": float(f"{limit_price:.2f}")
+        "quantity": round(float(quantity), 4),
+        "stopPrice": round(float(stop_price), 2),
+        "price": round(float(limit_price), 2)
     }
 
     data_to_sign = json.dumps(params, separators=(',', ':'))
@@ -350,10 +354,6 @@ def edit_stop_order(
 # =============================================================================
 
 def get_exchange_position_state(symbol: str):
-    """
-    Returns (quantity: float, side: str, entry_price: float)
-    Returns (None, "ERROR", None) on network timeout/failure so caller DOES NOT assume flat!
-    """
     target = clean_symbol(symbol)
     ts = str(get_synced_time())
 
@@ -451,11 +451,6 @@ def get_current_ticker_price(symbol: str) -> float:
     return 0.0
 
 def check_order_status(client_order_id: str, symbol: str):
-    """
-    Queries POST /v1/order/get-multiple.
-    Accepts 200 OK and 201 Created.
-    Extracts status, leveragedQty, cumQty, and avgPrice.
-    """
     payload = {
         "clientOrderIds": [str(client_order_id)],
         "timestamp": str(get_synced_time())
@@ -532,11 +527,11 @@ def place_stop_loss(symbol: str, side: str, qty: float, stop_price: float, trade
         "deviceType": "WEB",
         "marginAsset": "INR",
         "placeType": "ORDER_FORM",
-        "price": float(f"{limit_price:.2f}"),
-        "quantity": float(f"{qty:.4f}"),
+        "price": round(float(limit_price), 2),
+        "quantity": round(float(qty), 4),
         "reduceOnly": True,
         "side": side,
-        "stopPrice": float(f"{stop_price:.2f}"),
+        "stopPrice": round(float(stop_price), 2),
         "symbol": target,
         "type": "STOP_LIMIT"
     }
@@ -576,7 +571,6 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
         sl_side = watch["side"]
         live_qty, _, _ = get_exchange_position_state(target)
 
-        # CRITICAL FIX: If network error/timeout, live_qty is None -> DO NOT assume flat!
         if live_qty is None:
             continue
 
@@ -621,7 +615,7 @@ def flatten_position(symbol: str, side: str, qty: float) -> bool:
         "deviceType": "WEB",
         "marginAsset": "INR",
         "placeType": "ORDER_FORM",
-        "quantity": float(f"{qty:.4f}"),
+        "quantity": round(float(qty), 4),
         "reduceOnly": True,
         "side": side,
         "symbol": target,
@@ -738,6 +732,11 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
     target = clean_symbol(symbol)
     side = "BUY" if "BUY" in action else "SELL"
 
+    # Pre-sync clock immediately if idle for > 30 seconds to prevent signature drift
+    global LAST_API_CALL_TIME
+    if time.time() - LAST_API_CALL_TIME > 30.0:
+        sync_clock_directly()
+
     with ENGINE_LOCK:
         current_id = BOT_STATE.get("trade_id")
         if current_id is not None and trade_id < current_id:
@@ -779,8 +778,8 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
         BOT_STATE["position_active"] = False
         save_state()
 
-        clean_price = float(f"{price:.2f}")
-        clean_qty = float(f"{qty:.4f}")
+        clean_price = round(float(price), 2)
+        clean_qty = round(float(qty), 4)
 
         payload = {
             "deviceType": "WEB",
@@ -904,7 +903,7 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
         if live_qty is None:
             return
 
-        new_stop = float(f"{sl_price:.2f}")
+        new_stop = round(float(sl_price), 2)
         if new_stop <= 0:
             return
 
