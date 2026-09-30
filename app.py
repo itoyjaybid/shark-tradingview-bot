@@ -48,6 +48,7 @@ LAST_API_CALL_TIME = 0.0
 
 INITIAL_SL_POINTS = 100.0
 STOP_LIMIT_BUFFER = 15.0
+MIN_ORDER_QTY = 0.002  # Shark Exchange minimum order threshold
 
 # =============================================================================
 # BOT STATE
@@ -320,10 +321,12 @@ def edit_stop_order(
     if not client_order_id:
         return False
 
+    clean_qty = max(round(float(quantity), 4), MIN_ORDER_QTY)
+
     params = {
         "clientOrderId": str(client_order_id),
         "timestamp": str(get_synced_time()),
-        "quantity": round(float(quantity), 4),
+        "quantity": clean_qty,
         "stopPrice": round(float(stop_price), 2),
         "price": round(float(limit_price), 2)
     }
@@ -523,12 +526,14 @@ def place_stop_loss(symbol: str, side: str, qty: float, stop_price: float, trade
     else:
         limit_price = round(stop_price + offset, 2)
 
+    clean_qty = max(round(float(qty), 4), MIN_ORDER_QTY)
+
     payload = {
         "deviceType": "WEB",
         "marginAsset": "INR",
         "placeType": "ORDER_FORM",
         "price": round(float(limit_price), 2),
-        "quantity": round(float(qty), 4),
+        "quantity": clean_qty,
         "reduceOnly": True,
         "side": side,
         "stopPrice": round(float(stop_price), 2),
@@ -536,12 +541,12 @@ def place_stop_loss(symbol: str, side: str, qty: float, stop_price: float, trade
         "type": "STOP_LIMIT"
     }
 
-    print(f"[STOP PLACE] {side} Stop={stop_price} Limit={limit_price}", flush=True)
+    print(f"[STOP PLACE] {side} Stop={stop_price} Limit={limit_price} Qty={clean_qty}", flush=True)
     ok, cid = send_signed_order(payload)
 
     if ok and cid:
         print(f"[STOP PLACED] ID={cid}", flush=True)
-        register_sl_watch(cid, stop_price, limit_price, side, qty)
+        register_sl_watch(cid, stop_price, limit_price, side, clean_qty)
         threading.Thread(
             target=monitor_stop_order,
             args=(target, cid, trade_id),
@@ -611,18 +616,20 @@ def flatten_position(symbol: str, side: str, qty: float) -> bool:
     if qty <= 0:
         return False
 
+    clean_qty = max(round(float(qty), 4), MIN_ORDER_QTY)
+
     payload = {
         "deviceType": "WEB",
         "marginAsset": "INR",
         "placeType": "ORDER_FORM",
-        "quantity": round(float(qty), 4),
+        "quantity": clean_qty,
         "reduceOnly": True,
         "side": side,
         "symbol": target,
         "type": "MARKET"
     }
 
-    print(f"[MARKET EXIT] {side} {qty} {target}", flush=True)
+    print(f"[MARKET EXIT] {side} {clean_qty} {target}", flush=True)
     ok, _ = send_signed_order(payload)
     return ok
 
@@ -649,12 +656,13 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
                     save_state()
             return
 
-        filled_via_order_detail = status in ["FILLED", "PARTIAL"]
+        # Do NOT break on PARTIAL: must be FILLED or verified position >= 95%
+        filled_via_order_detail = (status == "FILLED")
         filled_via_backstop = False
 
         if not filled_via_order_detail:
             backstop_qty, backstop_side, _ = get_exchange_position_state(target)
-            if backstop_qty is not None and backstop_qty >= qty * 0.999 and backstop_side == side:
+            if backstop_qty is not None and backstop_qty >= qty * 0.95 and backstop_side == side:
                 filled_via_backstop = True
 
         if filled_via_order_detail or filled_via_backstop:
@@ -696,32 +704,34 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
                     return
             return
 
-    # Timeout reached
+    # Timeout reached - cancel resting remainder
     print(f"[ENTRY TIMEOUT] Cancelling {order_id}", flush=True)
     with ENGINE_LOCK:
         if BOT_STATE.get("trade_id") != trade_id:
             return
 
         cancel_ok = cancel_order(order_id)
-        if not cancel_ok:
-            live_qty, live_side, live_entry_price = get_exchange_position_state(target)
-            if live_qty is not None and live_qty >= qty * 0.999 and live_side == side:
-                real_fill = live_entry_price if live_entry_price > 0 else limit_price
-                BOT_STATE["side"] = live_side
-                BOT_STATE["qty"] = live_qty
-                BOT_STATE["fill_price"] = real_fill
-                BOT_STATE["entry_id"] = None
-                BOT_STATE["entry_active"] = False
-                BOT_STATE["position_active"] = True
+        
+        # Check if a partial or full fill settled before or during cancellation
+        live_qty, live_side, live_entry_price = get_exchange_position_state(target)
+        if live_qty is not None and live_qty >= MIN_ORDER_QTY and live_side == side:
+            print(f"[TIMEOUT FILL SALVAGED] Tracking active fill: {live_side} {live_qty}", flush=True)
+            real_fill = live_entry_price if live_entry_price > 0 else limit_price
+            BOT_STATE["side"] = live_side
+            BOT_STATE["qty"] = live_qty
+            BOT_STATE["fill_price"] = real_fill
+            BOT_STATE["entry_id"] = None
+            BOT_STATE["entry_active"] = False
+            BOT_STATE["position_active"] = True
 
-                initial_stop = round(real_fill - INITIAL_SL_POINTS, 2) if live_side == "BUY" else round(real_fill + INITIAL_SL_POINTS, 2)
-                sl_side = "SELL" if live_side == "BUY" else "BUY"
-                sl_id = place_stop_loss(target, sl_side, live_qty, initial_stop, trade_id)
-                if sl_id:
-                    BOT_STATE["sl_id"] = sl_id
-                    BOT_STATE["sl_price"] = initial_stop
-                    save_state()
-                return
+            initial_stop = round(real_fill - INITIAL_SL_POINTS, 2) if live_side == "BUY" else round(real_fill + INITIAL_SL_POINTS, 2)
+            sl_side = "SELL" if live_side == "BUY" else "BUY"
+            sl_id = place_stop_loss(target, sl_side, live_qty, initial_stop, trade_id)
+            if sl_id:
+                BOT_STATE["sl_id"] = sl_id
+                BOT_STATE["sl_price"] = initial_stop
+                save_state()
+            return
 
         if BOT_STATE.get("entry_id") == order_id:
             BOT_STATE["entry_id"] = None
@@ -779,7 +789,7 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
         save_state()
 
         clean_price = round(float(price), 2)
-        clean_qty = round(float(qty), 4)
+        clean_qty = max(round(float(qty), 4), MIN_ORDER_QTY)
 
         payload = {
             "deviceType": "WEB",
@@ -816,19 +826,21 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
 
 def attempt_stop_update(target: str, sl_side: str, live_qty: float, new_stop: float, trade_id: int) -> bool:
     old_sl_id = BOT_STATE.get("sl_id")
+    clean_qty = max(round(float(live_qty), 4), MIN_ORDER_QTY)
+
     if old_sl_id:
         offset = STOP_LIMIT_BUFFER
         new_limit = round(new_stop - offset, 2) if sl_side == "SELL" else round(new_stop + offset, 2)
 
-        if edit_stop_order(old_sl_id, live_qty, new_stop, new_limit):
-            update_sl_watch(old_sl_id, stop_price=new_stop, limit_price=new_limit, qty=live_qty)
-            BOT_STATE["qty"] = live_qty
+        if edit_stop_order(old_sl_id, clean_qty, new_stop, new_limit):
+            update_sl_watch(old_sl_id, stop_price=new_stop, limit_price=new_limit, qty=clean_qty)
+            BOT_STATE["qty"] = clean_qty
             BOT_STATE["sl_price"] = new_stop
             save_state()
             print(f"[STOP UPDATED] {new_stop}", flush=True)
             return True
 
-        new_sl_id = place_stop_loss(target, sl_side, live_qty, new_stop, trade_id)
+        new_sl_id = place_stop_loss(target, sl_side, clean_qty, new_stop, trade_id)
         if new_sl_id:
             cancel_order(old_sl_id)
             remove_sl_watch(old_sl_id)
@@ -839,7 +851,7 @@ def attempt_stop_update(target: str, sl_side: str, live_qty: float, new_stop: fl
             return True
         return False
 
-    new_sl_id = place_stop_loss(target, sl_side, live_qty, new_stop, trade_id)
+    new_sl_id = place_stop_loss(target, sl_side, clean_qty, new_stop, trade_id)
     if new_sl_id:
         BOT_STATE["sl_id"] = new_sl_id
         BOT_STATE["sl_price"] = new_stop
