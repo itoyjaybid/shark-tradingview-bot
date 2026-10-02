@@ -48,7 +48,15 @@ LAST_API_CALL_TIME = 0.0
 
 INITIAL_SL_POINTS = 100.0
 STOP_LIMIT_BUFFER = 15.0
-MIN_ORDER_QTY = 0.002  # Shark Exchange minimum order threshold
+MIN_ORDER_QTY = 0.002  # Shark Exchange lot threshold
+
+def clean_num(val: float, precision: int = 2):
+    """
+    Normalizes floats so whole numbers serialize without a trailing .0.
+    Prevents HMAC signature mismatches with the exchange's JSON parser.
+    """
+    rounded = round(float(val), precision)
+    return int(rounded) if rounded.is_integer() else rounded
 
 # =============================================================================
 # BOT STATE
@@ -241,8 +249,9 @@ def send_signed_order(payload: dict, max_retries: int = 3):
     for attempt in range(max_retries):
         if attempt > 0:
             sync_clock_directly()
-            time.sleep(0.12)
+            time.sleep(0.15)
 
+        # Regenerate timestamp and re-sign on every attempt
         payload["timestamp"] = str(get_synced_time())
         data_to_sign = json.dumps(payload, separators=(',', ':'))
         headers = sign_data(data_to_sign)
@@ -321,14 +330,12 @@ def edit_stop_order(
     if not client_order_id:
         return False
 
-    clean_qty = max(round(float(quantity), 4), MIN_ORDER_QTY)
-
     params = {
         "clientOrderId": str(client_order_id),
         "timestamp": str(get_synced_time()),
-        "quantity": clean_qty,
-        "stopPrice": round(float(stop_price), 2),
-        "price": round(float(limit_price), 2)
+        "quantity": clean_num(max(quantity, MIN_ORDER_QTY), 4),
+        "stopPrice": clean_num(stop_price, 2),
+        "price": clean_num(limit_price, 2)
     }
 
     data_to_sign = json.dumps(params, separators=(',', ':'))
@@ -526,27 +533,28 @@ def place_stop_loss(symbol: str, side: str, qty: float, stop_price: float, trade
     else:
         limit_price = round(stop_price + offset, 2)
 
-    clean_qty = max(round(float(qty), 4), MIN_ORDER_QTY)
-
     payload = {
         "deviceType": "WEB",
         "marginAsset": "INR",
         "placeType": "ORDER_FORM",
-        "price": round(float(limit_price), 2),
-        "quantity": clean_qty,
+        "price": clean_num(limit_price, 2),
+        "quantity": clean_num(max(qty, MIN_ORDER_QTY), 4),
         "reduceOnly": True,
         "side": side,
-        "stopPrice": round(float(stop_price), 2),
+        "stopPrice": clean_num(stop_price, 2),
         "symbol": target,
         "type": "STOP_LIMIT"
     }
 
-    print(f"[STOP PLACE] {side} Stop={stop_price} Limit={limit_price} Qty={clean_qty}", flush=True)
+    print(
+        f"[STOP PLACE] {side} Stop={payload['stopPrice']} Limit={payload['price']} Qty={payload['quantity']}",
+        flush=True
+    )
     ok, cid = send_signed_order(payload)
 
     if ok and cid:
         print(f"[STOP PLACED] ID={cid}", flush=True)
-        register_sl_watch(cid, stop_price, limit_price, side, clean_qty)
+        register_sl_watch(cid, stop_price, limit_price, side, payload["quantity"])
         threading.Thread(
             target=monitor_stop_order,
             args=(target, cid, trade_id),
@@ -616,20 +624,18 @@ def flatten_position(symbol: str, side: str, qty: float) -> bool:
     if qty <= 0:
         return False
 
-    clean_qty = max(round(float(qty), 4), MIN_ORDER_QTY)
-
     payload = {
         "deviceType": "WEB",
         "marginAsset": "INR",
         "placeType": "ORDER_FORM",
-        "quantity": clean_qty,
+        "quantity": clean_num(max(qty, MIN_ORDER_QTY), 4),
         "reduceOnly": True,
         "side": side,
         "symbol": target,
         "type": "MARKET"
     }
 
-    print(f"[MARKET EXIT] {side} {clean_qty} {target}", flush=True)
+    print(f"[MARKET EXIT] {side} {payload['quantity']} {target}", flush=True)
     ok, _ = send_signed_order(payload)
     return ok
 
@@ -710,9 +716,8 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
         if BOT_STATE.get("trade_id") != trade_id:
             return
 
-        cancel_ok = cancel_order(order_id)
-        
-        # Check if a partial or full fill settled before or during cancellation
+        cancel_order(order_id)
+
         live_qty, live_side, live_entry_price = get_exchange_position_state(target)
         if live_qty is not None and live_qty >= MIN_ORDER_QTY and live_side == side:
             print(f"[TIMEOUT FILL SALVAGED] Tracking active fill: {live_side} {live_qty}", flush=True)
@@ -742,7 +747,6 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
     target = clean_symbol(symbol)
     side = "BUY" if "BUY" in action else "SELL"
 
-    # Pre-sync clock immediately if idle for > 30 seconds to prevent signature drift
     global LAST_API_CALL_TIME
     if time.time() - LAST_API_CALL_TIME > 30.0:
         sync_clock_directly()
@@ -788,22 +792,19 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
         BOT_STATE["position_active"] = False
         save_state()
 
-        clean_price = round(float(price), 2)
-        clean_qty = max(round(float(qty), 4), MIN_ORDER_QTY)
-
         payload = {
             "deviceType": "WEB",
             "marginAsset": "INR",
             "placeType": "ORDER_FORM",
-            "price": clean_price,
-            "quantity": clean_qty,
+            "price": clean_num(price, 2),
+            "quantity": clean_num(max(qty, MIN_ORDER_QTY), 4),
             "reduceOnly": False,
             "side": side,
             "symbol": target,
             "type": "LIMIT"
         }
 
-        print(f"[ENTRY] {side} {clean_qty} {target} @ {clean_price}", flush=True)
+        print(f"[ENTRY] {side} {payload['quantity']} {target} @ {payload['price']}", flush=True)
         ok, cid = send_signed_order(payload)
 
         if not ok or not cid:
@@ -816,7 +817,7 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
 
         threading.Thread(
             target=entry_order_watcher,
-            args=(target, side, clean_price, trade_id, clean_qty, cid, timeout_sec),
+            args=(target, side, payload["price"], trade_id, payload["quantity"], cid, timeout_sec),
             daemon=True
         ).start()
 
@@ -826,7 +827,7 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
 
 def attempt_stop_update(target: str, sl_side: str, live_qty: float, new_stop: float, trade_id: int) -> bool:
     old_sl_id = BOT_STATE.get("sl_id")
-    clean_qty = max(round(float(live_qty), 4), MIN_ORDER_QTY)
+    clean_qty = clean_num(max(live_qty, MIN_ORDER_QTY), 4)
 
     if old_sl_id:
         offset = STOP_LIMIT_BUFFER
