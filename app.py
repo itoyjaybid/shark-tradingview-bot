@@ -48,13 +48,9 @@ LAST_API_CALL_TIME = 0.0
 
 INITIAL_SL_POINTS = 100.0
 STOP_LIMIT_BUFFER = 15.0
-MIN_ORDER_QTY = 0.002  # Shark Exchange lot threshold
+MIN_ORDER_QTY = 0.002
 
 def clean_num(val: float, precision: int = 2):
-    """
-    Normalizes floats so whole numbers serialize without a trailing .0.
-    Prevents HMAC signature mismatches with the exchange's JSON parser.
-    """
     rounded = round(float(val), precision)
     return int(rounded) if rounded.is_integer() else rounded
 
@@ -251,7 +247,6 @@ def send_signed_order(payload: dict, max_retries: int = 3):
             sync_clock_directly()
             time.sleep(0.15)
 
-        # Regenerate timestamp and re-sign on every attempt
         payload["timestamp"] = str(get_synced_time())
         data_to_sign = json.dumps(payload, separators=(',', ':'))
         headers = sign_data(data_to_sign)
@@ -601,12 +596,23 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
 
         breached = (curr_price < limit_price) if sl_side == "SELL" else (curr_price > limit_price)
         if breached:
+            # Re-verify position before attempting emergency flatten to avoid double-exit
+            live_qty, _, _ = get_exchange_position_state(target)
+            if live_qty is None or live_qty <= 0.000001:
+                print("[STOP MONITOR] Order already filled on exchange. Flat confirmed.", flush=True)
+                with ENGINE_LOCK:
+                    purge_state()
+                remove_sl_watch(sl_id)
+                return
+
             print(f"[STOP GAP] Price={curr_price} Limit={limit_price}", flush=True)
             with ENGINE_LOCK:
                 if BOT_STATE.get("sl_id") == sl_id and BOT_STATE.get("trade_id") == trade_id:
+                    # Cancel resting SL first to release locked collateral
+                    cancel_order(sl_id)
+                    time.sleep(0.15)
                     flatten_position(target, sl_side, live_qty)
                     if wait_until_flat(target, timeout_sec=5):
-                        cancel_order(sl_id)
                         purge_state()
                     else:
                         print("[CRITICAL] Emergency flatten failed during stop gap.", flush=True)
@@ -662,7 +668,6 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
                     save_state()
             return
 
-        # Do NOT break on PARTIAL: must be FILLED or verified position >= 95%
         filled_via_order_detail = (status == "FILLED")
         filled_via_backstop = False
 
@@ -760,6 +765,9 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
         live_qty, live_side, _ = get_exchange_position_state(target)
         if live_qty is not None and live_qty > 0 and live_side != side:
             print(f"[REVERSAL] Closing {live_side} before {side}", flush=True)
+            if BOT_STATE.get("sl_id"):
+                cancel_order(BOT_STATE["sl_id"])
+                time.sleep(0.15)
             opposite = "SELL" if live_side == "BUY" else "BUY"
             flatten_position(target, opposite, live_qty)
 
@@ -767,8 +775,6 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
                 print("[REVERSAL ABORTED] Could not confirm flat position.", flush=True)
                 return
 
-            if BOT_STATE.get("sl_id"):
-                cancel_order(BOT_STATE["sl_id"])
             purge_state()
 
         if BOT_STATE.get("entry_id"):
@@ -963,15 +969,16 @@ def process_close(symbol: str):
         if BOT_STATE.get("entry_id"):
             cancel_order(BOT_STATE["entry_id"])
 
+        if BOT_STATE.get("sl_id"):
+            cancel_order(BOT_STATE["sl_id"])
+            time.sleep(0.15)
+
         live_qty, live_side, _ = get_exchange_position_state(target)
         if live_qty is not None and live_qty > 0:
             opposite = "SELL" if live_side == "BUY" else "BUY"
             flatten_position(target, opposite, live_qty)
             if not wait_until_flat(target, timeout_sec=5):
                 return
-
-        if BOT_STATE.get("sl_id"):
-            cancel_order(BOT_STATE["sl_id"])
 
         purge_state()
 
