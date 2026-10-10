@@ -46,8 +46,8 @@ LAST_USED_TIMESTAMP = 0
 CLOCK_OFFSET_MS = 0
 LAST_API_CALL_TIME = 0.0
 
-INITIAL_SL_POINTS = 100.0
-STOP_LIMIT_BUFFER = 15.0
+DEFAULT_INITIAL_SL_POINTS = 100.0
+DEFAULT_STOP_LIMIT_BUFFER = 15.0
 MIN_ORDER_QTY = 0.002
 
 def clean_num(val: float, precision: int = 2):
@@ -67,7 +67,9 @@ BOT_STATE = {
     "fill_price": 0.0,
     "sl_price": 0.0,
     "entry_active": False,
-    "position_active": False
+    "position_active": False,
+    "initial_sl_hint": 0.0,
+    "sl_buffer": DEFAULT_STOP_LIMIT_BUFFER
 }
 
 SL_WATCH_LOCK = threading.Lock()
@@ -127,10 +129,9 @@ def load_state():
                 loaded = json.load(f)
             BOT_STATE.update(loaded)
             print(
-                f"[STATE LOADED] "
-                f"TradeID={BOT_STATE.get('trade_id')} "
-                f"Side={BOT_STATE.get('side')} "
-                f"Qty={BOT_STATE.get('qty')}",
+                f"[STATE LOADED] TradeID={BOT_STATE.get('trade_id')} "
+                f"Side={BOT_STATE.get('side')} Qty={BOT_STATE.get('qty')} "
+                f"SL_Buffer={BOT_STATE.get('sl_buffer')}",
                 flush=True
             )
         except Exception as e:
@@ -156,6 +157,8 @@ def purge_state():
     BOT_STATE["sl_price"] = 0.0
     BOT_STATE["entry_active"] = False
     BOT_STATE["position_active"] = False
+    BOT_STATE["initial_sl_hint"] = 0.0
+    BOT_STATE["sl_buffer"] = DEFAULT_STOP_LIMIT_BUFFER
     save_state()
     remove_sl_watch(old_sl_id)
 
@@ -190,8 +193,7 @@ def update_clock_from_server_time(iso_time_str: str):
         new_offset = srv_ts - local_ts
         if abs(new_offset - CLOCK_OFFSET_MS) > 200:
             print(
-                f"[CLOCK SYNC] Offset updated from response: "
-                f"{CLOCK_OFFSET_MS}ms -> {new_offset}ms",
+                f"[CLOCK SYNC] Offset updated: {CLOCK_OFFSET_MS}ms -> {new_offset}ms",
                 flush=True
             )
         CLOCK_OFFSET_MS = new_offset
@@ -270,8 +272,7 @@ def send_signed_order(payload: dict, max_retries: int = 3):
             if r.status_code == 403 or "4007" in r.text or "Signature mismatch" in r.text:
                 print(
                     f"[SIGNATURE RETRY] Attempt {attempt + 1} -> "
-                    f"HTTP {r.status_code}: {r.text} | "
-                    f"timestamp_used={payload.get('timestamp')}",
+                    f"HTTP {r.status_code}: {r.text} | timestamp_used={payload.get('timestamp')}",
                     flush=True
                 )
                 continue
@@ -472,10 +473,7 @@ def check_order_status(client_order_id: str, symbol: str):
         )
         if r.status_code not in [200, 201]:
             if client_order_id not in ORDER_STATUS_FAIL_LOGGED:
-                print(
-                    f"[ORDER STATUS FAILED] ID={client_order_id} -> HTTP {r.status_code}: {r.text}",
-                    flush=True
-                )
+                print(f"[ORDER STATUS FAILED] ID={client_order_id} -> HTTP {r.status_code}: {r.text}", flush=True)
                 ORDER_STATUS_FAIL_LOGGED.add(client_order_id)
             return "UNKNOWN", 0.0
 
@@ -516,12 +514,12 @@ def check_order_status(client_order_id: str, symbol: str):
     return "UNKNOWN", 0.0
 
 # =============================================================================
-# STOP LOSS & EXECUTION FLOW
+# STOP LOSS & BLOWOUT MONITORING
 # =============================================================================
 
-def place_stop_loss(symbol: str, side: str, qty: float, stop_price: float, trade_id: int):
+def place_stop_loss(symbol: str, side: str, qty: float, stop_price: float, trade_id: int, sl_buffer: float = DEFAULT_STOP_LIMIT_BUFFER):
     target = clean_symbol(symbol)
-    offset = STOP_LIMIT_BUFFER
+    offset = float(sl_buffer)
 
     if side == "SELL":
         limit_price = round(stop_price - offset, 2)
@@ -542,13 +540,13 @@ def place_stop_loss(symbol: str, side: str, qty: float, stop_price: float, trade
     }
 
     print(
-        f"[STOP PLACE] {side} Stop={payload['stopPrice']} Limit={payload['price']} Qty={payload['quantity']}",
+        f"[STOP_LIMIT PLACED IMMEDIATELY ON FILL] {side} Stop={payload['stopPrice']} "
+        f"Limit={payload['price']} Buffer={offset} Qty={payload['quantity']}",
         flush=True
     )
     ok, cid = send_signed_order(payload)
 
     if ok and cid:
-        print(f"[STOP PLACED] ID={cid}", flush=True)
         register_sl_watch(cid, stop_price, limit_price, side, payload["quantity"])
         threading.Thread(
             target=monitor_stop_order,
@@ -594,9 +592,9 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
         if curr_price <= 0:
             continue
 
+        # Emergency Market Flattening if price blows past the SL buffer limit
         breached = (curr_price < limit_price) if sl_side == "SELL" else (curr_price > limit_price)
         if breached:
-            # Re-verify position before attempting emergency flatten to avoid double-exit
             live_qty, _, _ = get_exchange_position_state(target)
             if live_qty is None or live_qty <= 0.000001:
                 print("[STOP MONITOR] Order already filled on exchange. Flat confirmed.", flush=True)
@@ -605,10 +603,9 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
                 remove_sl_watch(sl_id)
                 return
 
-            print(f"[STOP GAP] Price={curr_price} Limit={limit_price}", flush=True)
+            print(f"[STOP GAP BLOWOUT] Price={curr_price} Limit={limit_price}. Executing Emergency Flatten.", flush=True)
             with ENGINE_LOCK:
                 if BOT_STATE.get("sl_id") == sl_id and BOT_STATE.get("trade_id") == trade_id:
-                    # Cancel resting SL first to release locked collateral
                     cancel_order(sl_id)
                     time.sleep(0.15)
                     flatten_position(target, sl_side, live_qty)
@@ -645,13 +642,15 @@ def flatten_position(symbol: str, side: str, qty: float) -> bool:
     ok, _ = send_signed_order(payload)
     return ok
 
-def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: int, qty: float, order_id: str, timeout_sec: int):
+# =============================================================================
+# CONTINUOUS ORDER WATCHER (NO TIMEOUT - INDEFINITE WAIT)
+# =============================================================================
+
+def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: int, qty: float, order_id: str, sl_hint: float, sl_buffer: float):
     target = clean_symbol(symbol)
-    start = time.time()
+    print(f"[ENTRY WATCHER] Monitoring Limit Order {order_id} at {limit_price} until executed.", flush=True)
 
-    print(f"[ENTRY WATCHER] ID={order_id} Timeout={timeout_sec}s", flush=True)
-
-    while time.time() - start < timeout_sec:
+    while True:
         time.sleep(0.8)
 
         with ENGINE_LOCK:
@@ -660,7 +659,7 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
 
         status, exec_price = check_order_status(order_id, target)
         if status == "CANCELLED":
-            print("[ENTRY WATCHER] Entry cancelled/rejected.", flush=True)
+            print("[ENTRY WATCHER] Order cancelled or rejected by user/reset.", flush=True)
             with ENGINE_LOCK:
                 if BOT_STATE.get("entry_id") == order_id:
                     BOT_STATE["entry_id"] = None
@@ -682,7 +681,7 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
                 continue
 
             real_fill = exec_price if exec_price > 0 else (live_entry_price if live_entry_price > 0 else limit_price)
-            print(f"[ENTRY FILLED] {live_side} Qty={live_qty} Price={real_fill}", flush=True)
+            print(f"[ENTRY LIMIT FILLED] {live_side} Qty={live_qty} Fill={real_fill}. Submitting Stop Limit at {sl_hint} immediately.", flush=True)
 
             with ENGINE_LOCK:
                 if BOT_STATE.get("trade_id") != trade_id:
@@ -695,60 +694,23 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
                 BOT_STATE["entry_active"] = False
                 BOT_STATE["position_active"] = True
 
-                if live_side == "BUY":
-                    initial_stop = round(real_fill - INITIAL_SL_POINTS, 2)
-                    sl_side = "SELL"
-                else:
-                    initial_stop = round(real_fill + INITIAL_SL_POINTS, 2)
-                    sl_side = "BUY"
+                initial_stop = round(sl_hint, 2)
+                sl_side = "SELL" if live_side == "BUY" else "BUY"
 
-                sl_id = place_stop_loss(target, sl_side, live_qty, initial_stop, trade_id)
+                sl_id = place_stop_loss(target, sl_side, live_qty, initial_stop, trade_id, sl_buffer)
                 if sl_id:
                     BOT_STATE["sl_id"] = sl_id
                     BOT_STATE["sl_price"] = initial_stop
                     save_state()
                 else:
-                    print("[CRITICAL] Initial SL failed. Exiting market.", flush=True)
+                    print("[CRITICAL] Stop-Limit submission failed. Exiting at market.", flush=True)
                     flatten_position(target, sl_side, live_qty)
                     if wait_until_flat(target, 5):
                         purge_state()
                     return
             return
 
-    # Timeout reached - cancel resting remainder
-    print(f"[ENTRY TIMEOUT] Cancelling {order_id}", flush=True)
-    with ENGINE_LOCK:
-        if BOT_STATE.get("trade_id") != trade_id:
-            return
-
-        cancel_order(order_id)
-
-        live_qty, live_side, live_entry_price = get_exchange_position_state(target)
-        if live_qty is not None and live_qty >= MIN_ORDER_QTY and live_side == side:
-            print(f"[TIMEOUT FILL SALVAGED] Tracking active fill: {live_side} {live_qty}", flush=True)
-            real_fill = live_entry_price if live_entry_price > 0 else limit_price
-            BOT_STATE["side"] = live_side
-            BOT_STATE["qty"] = live_qty
-            BOT_STATE["fill_price"] = real_fill
-            BOT_STATE["entry_id"] = None
-            BOT_STATE["entry_active"] = False
-            BOT_STATE["position_active"] = True
-
-            initial_stop = round(real_fill - INITIAL_SL_POINTS, 2) if live_side == "BUY" else round(real_fill + INITIAL_SL_POINTS, 2)
-            sl_side = "SELL" if live_side == "BUY" else "BUY"
-            sl_id = place_stop_loss(target, sl_side, live_qty, initial_stop, trade_id)
-            if sl_id:
-                BOT_STATE["sl_id"] = sl_id
-                BOT_STATE["sl_price"] = initial_stop
-                save_state()
-            return
-
-        if BOT_STATE.get("entry_id") == order_id:
-            BOT_STATE["entry_id"] = None
-            BOT_STATE["entry_active"] = False
-            save_state()
-
-def process_entry_signal(action: str, symbol: str, qty: float, price: float, trade_id: int, timeout_sec: int):
+def process_entry_signal(action: str, symbol: str, qty: float, price: float, trade_id: int, sl_hint: float, sl_buffer: float):
     target = clean_symbol(symbol)
     side = "BUY" if "BUY" in action else "SELL"
 
@@ -764,7 +726,7 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
 
         live_qty, live_side, _ = get_exchange_position_state(target)
         if live_qty is not None and live_qty > 0 and live_side != side:
-            print(f"[REVERSAL] Closing {live_side} before {side}", flush=True)
+            print(f"[REVERSAL] Closing {live_side} before entering {side}", flush=True)
             if BOT_STATE.get("sl_id"):
                 cancel_order(BOT_STATE["sl_id"])
                 time.sleep(0.15)
@@ -796,6 +758,8 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
         BOT_STATE["sl_price"] = 0.0
         BOT_STATE["entry_active"] = True
         BOT_STATE["position_active"] = False
+        BOT_STATE["initial_sl_hint"] = sl_hint
+        BOT_STATE["sl_buffer"] = sl_buffer
         save_state()
 
         payload = {
@@ -810,7 +774,7 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
             "type": "LIMIT"
         }
 
-        print(f"[ENTRY] {side} {payload['quantity']} {target} @ {payload['price']}", flush=True)
+        print(f"[RESTING LIMIT ENTRY] {side} {payload['quantity']} {target} @ {payload['price']}", flush=True)
         ok, cid = send_signed_order(payload)
 
         if not ok or not cid:
@@ -823,51 +787,54 @@ def process_entry_signal(action: str, symbol: str, qty: float, price: float, tra
 
         threading.Thread(
             target=entry_order_watcher,
-            args=(target, side, payload["price"], trade_id, payload["quantity"], cid, timeout_sec),
+            args=(target, side, payload["price"], trade_id, payload["quantity"], cid, sl_hint, sl_buffer),
             daemon=True
         ).start()
 
 # =============================================================================
-# TRAILING & EXIT LOGIC
+# STOP UPDATES
 # =============================================================================
 
-def attempt_stop_update(target: str, sl_side: str, live_qty: float, new_stop: float, trade_id: int) -> bool:
+def attempt_stop_update(target: str, sl_side: str, live_qty: float, new_stop: float, trade_id: int, sl_buffer: float) -> bool:
     old_sl_id = BOT_STATE.get("sl_id")
     clean_qty = clean_num(max(live_qty, MIN_ORDER_QTY), 4)
+    offset = float(sl_buffer)
 
     if old_sl_id:
-        offset = STOP_LIMIT_BUFFER
         new_limit = round(new_stop - offset, 2) if sl_side == "SELL" else round(new_stop + offset, 2)
 
         if edit_stop_order(old_sl_id, clean_qty, new_stop, new_limit):
             update_sl_watch(old_sl_id, stop_price=new_stop, limit_price=new_limit, qty=clean_qty)
             BOT_STATE["qty"] = clean_qty
             BOT_STATE["sl_price"] = new_stop
+            BOT_STATE["sl_buffer"] = offset
             save_state()
-            print(f"[STOP UPDATED] {new_stop}", flush=True)
+            print(f"[STOP UPDATED] {new_stop} Limit={new_limit}", flush=True)
             return True
 
-        new_sl_id = place_stop_loss(target, sl_side, clean_qty, new_stop, trade_id)
+        new_sl_id = place_stop_loss(target, sl_side, clean_qty, new_stop, trade_id, offset)
         if new_sl_id:
             cancel_order(old_sl_id)
             remove_sl_watch(old_sl_id)
             BOT_STATE["sl_id"] = new_sl_id
             BOT_STATE["sl_price"] = new_stop
+            BOT_STATE["sl_buffer"] = offset
             save_state()
             print(f"[STOP UPDATED] {new_stop}", flush=True)
             return True
         return False
 
-    new_sl_id = place_stop_loss(target, sl_side, clean_qty, new_stop, trade_id)
+    new_sl_id = place_stop_loss(target, sl_side, clean_qty, new_stop, trade_id, offset)
     if new_sl_id:
         BOT_STATE["sl_id"] = new_sl_id
         BOT_STATE["sl_price"] = new_stop
+        BOT_STATE["sl_buffer"] = offset
         save_state()
         print(f"[STOP UPDATED] {new_stop}", flush=True)
         return True
     return False
 
-def sl_update_retry_loop(symbol: str, trade_id: int):
+def sl_update_retry_loop(symbol: str, trade_id: int, sl_buffer: float):
     target = clean_symbol(symbol)
     backoffs = [2, 3, 5, 8, 13, 20, 30]
     attempt = 0
@@ -893,7 +860,7 @@ def sl_update_retry_loop(symbol: str, trade_id: int):
 
             if live_qty is not None and live_qty > 0:
                 sl_side = "SELL" if live_side == "BUY" else "BUY"
-                success = attempt_stop_update(target, sl_side, live_qty, pending_stop, trade_id)
+                success = attempt_stop_update(target, sl_side, live_qty, pending_stop, trade_id, sl_buffer)
                 if success:
                     with PENDING_SL_LOCK:
                         if PENDING_SL.get(trade_id) == pending_stop:
@@ -907,7 +874,7 @@ def sl_update_retry_loop(symbol: str, trade_id: int):
     with PENDING_SL_LOCK:
         RETRY_THREAD_ACTIVE.discard(trade_id)
 
-def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: int):
+def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: int, sl_buffer: float):
     target = clean_symbol(symbol)
 
     with ENGINE_LOCK:
@@ -936,7 +903,7 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
                 return
             sl_side = "BUY"
 
-        success = attempt_stop_update(target, sl_side, live_qty, new_stop, trade_id)
+        success = attempt_stop_update(target, sl_side, live_qty, new_stop, trade_id, sl_buffer)
         if success:
             with PENDING_SL_LOCK:
                 PENDING_SL.pop(trade_id, None)
@@ -948,13 +915,13 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
                 RETRY_THREAD_ACTIVE.add(trade_id)
                 threading.Thread(
                     target=sl_update_retry_loop,
-                    args=(target, trade_id),
+                    args=(target, trade_id, sl_buffer),
                     daemon=True
                 ).start()
 
 def process_cancel_entry(symbol: str, trade_id: int):
     with ENGINE_LOCK:
-        if BOT_STATE.get("trade_id") != trade_id:
+        if BOT_STATE.get("trade_id") != trade_id and trade_id != 0:
             return
         entry_id = BOT_STATE.get("entry_id")
         if entry_id:
@@ -1029,28 +996,28 @@ async def receive_webhook(request: Request):
     price = float(data.get("price", 0.0))
     sl_price = float(data.get("sl_price", 0.0))
     trade_id = int(data.get("trade_id", 0))
-    timeout_sec = int(data.get("timeout_sec", 300))
+    sl_buffer = float(data.get("sl_buffer", BOT_STATE.get("sl_buffer", DEFAULT_STOP_LIMIT_BUFFER)))
 
     if action == "UPDATE_SL" and sl_price == 0.0 and price > 0.0:
         sl_price = price
 
     print(
         f"[WEBHOOK] Action={action} TradeID={trade_id} "
-        f"Qty={qty} Price={price} SL={sl_price}",
+        f"Qty={qty} Price={price} SL={sl_price} Buffer={sl_buffer}",
         flush=True
     )
 
     if action in ["BUY", "SELL", "REVERSE_BUY", "REVERSE_SELL"]:
         threading.Thread(
             target=process_entry_signal,
-            args=(action, symbol, qty, price, trade_id, timeout_sec),
+            args=(action, symbol, qty, price, trade_id, sl_price, sl_buffer),
             daemon=True
         ).start()
 
     elif action == "UPDATE_SL":
         threading.Thread(
             target=process_trailing_signal,
-            args=(symbol, qty, sl_price, trade_id),
+            args=(symbol, qty, sl_price, trade_id, sl_buffer),
             daemon=True
         ).start()
 
