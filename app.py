@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import hmac
@@ -46,7 +47,6 @@ LAST_USED_TIMESTAMP = 0
 CLOCK_OFFSET_MS = 0
 LAST_API_CALL_TIME = 0.0
 
-DEFAULT_INITIAL_SL_POINTS = 100.0
 DEFAULT_STOP_LIMIT_BUFFER = 15.0
 MIN_ORDER_QTY = 0.002
 
@@ -592,7 +592,6 @@ def monitor_stop_order(symbol: str, sl_id: str, trade_id: int):
         if curr_price <= 0:
             continue
 
-        # Emergency Market Flattening if price blows past the SL buffer limit
         breached = (curr_price < limit_price) if sl_side == "SELL" else (curr_price > limit_price)
         if breached:
             live_qty, _, _ = get_exchange_position_state(target)
@@ -983,8 +982,14 @@ async def diag_outbound_ip():
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     try:
-        data = await request.json()
-    except Exception:
+        raw_body = await request.body()
+        body_text = raw_body.decode("utf-8")
+        
+        # Regex auto-heals numbers lacking leading zero (e.g., ":.0020" -> ":0.0020")
+        cleaned_text = re.sub(r'(:\s*)\.([0-9]+)', r'\g<1>0.\2', body_text)
+        data = json.loads(cleaned_text)
+    except Exception as e:
+        print(f"[PAYLOAD PARSE ERROR] {e} | Raw text: {body_text}", flush=True)
         return {"status": "bad payload"}
 
     if data.get("secret") != WEBHOOK_PASSPHRASE:
