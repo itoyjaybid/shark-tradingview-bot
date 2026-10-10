@@ -12,7 +12,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 
 import urllib3.util.connection as urllib3_cn
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, Response, HTTPException
 
 # =============================================================================
 # FORCE IPV4
@@ -642,7 +642,7 @@ def flatten_position(symbol: str, side: str, qty: float) -> bool:
     return ok
 
 # =============================================================================
-# CONTINUOUS ORDER WATCHER (NO TIMEOUT - INDEFINITE WAIT)
+# ENTRY ORDER WATCHER (RESTING LIMIT - NO TIMEOUT)
 # =============================================================================
 
 def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: int, qty: float, order_id: str, sl_hint: float, sl_buffer: float):
@@ -658,7 +658,7 @@ def entry_order_watcher(symbol: str, side: str, limit_price: float, trade_id: in
 
         status, exec_price = check_order_status(order_id, target)
         if status == "CANCELLED":
-            print("[ENTRY WATCHER] Order cancelled or rejected by user/reset.", flush=True)
+            print("[ENTRY WATCHER] Order cancelled or superseded.", flush=True)
             with ENGINE_LOCK:
                 if BOT_STATE.get("entry_id") == order_id:
                     BOT_STATE["entry_id"] = None
@@ -882,6 +882,7 @@ def process_trailing_signal(symbol: str, qty: float, sl_price: float, trade_id: 
 
         live_qty, live_side, _ = get_exchange_position_state(target)
         if live_qty is not None and live_qty <= 0:
+            print("[SYNC CHECK] UPDATE_SL received while Shark Exchange is FLAT. Dropping.", flush=True)
             purge_state()
             return
 
@@ -945,6 +946,8 @@ def process_close(symbol: str):
             flatten_position(target, opposite, live_qty)
             if not wait_until_flat(target, timeout_sec=5):
                 return
+        else:
+            print("[SYNC CHECK] Close received while Shark Exchange is already FLAT. Clearing state.", flush=True)
 
         purge_state()
 
@@ -952,17 +955,21 @@ def process_close(symbol: str):
 # FASTAPI LIFECYCLE & ROUTES
 # =============================================================================
 
-def clock_resync_loop():
+def keep_alive_and_sync_loop():
     while True:
-        time.sleep(300)
+        time.sleep(240)  # Ping every 4 minutes (prevents Render 15-min idle sleep)
         sync_clock_directly()
+        try:
+            requests.get("https://shark-tradingview-bot.onrender.com/", timeout=4)
+        except Exception:
+            pass
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_state()
     sync_clock_directly()
     print(f"[BOOT] Clock Offset = {CLOCK_OFFSET_MS}ms", flush=True)
-    threading.Thread(target=clock_resync_loop, daemon=True).start()
+    threading.Thread(target=keep_alive_and_sync_loop, daemon=True).start()
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -970,6 +977,10 @@ app = FastAPI(lifespan=lifespan)
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"status": "online"}
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)  # Silences 404 logs from browser favicon checks
 
 @app.get("/diag/outbound-ip")
 async def diag_outbound_ip():
@@ -985,7 +996,7 @@ async def receive_webhook(request: Request):
         raw_body = await request.body()
         body_text = raw_body.decode("utf-8")
         
-        # Regex auto-heals numbers lacking leading zero (e.g., ":.0020" -> ":0.0020")
+        # Regex heals numbers lacking a leading zero (e.g. ":.0020" -> ":0.0020")
         cleaned_text = re.sub(r'(:\s*)\.([0-9]+)', r'\g<1>0.\2', body_text)
         data = json.loads(cleaned_text)
     except Exception as e:
