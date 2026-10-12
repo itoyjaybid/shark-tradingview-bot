@@ -23,6 +23,7 @@ BASE_URL = os.getenv("SHARK_BASE_URL", "https://api.sharkexchange.in")
 last_processed_trade_id: Optional[int] = None
 clock_offset_ms: int = 0
 active_watcher_tasks = {}
+active_sl_order_ids = {}
 
 STANDARD_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -36,7 +37,7 @@ STANDARD_HEADERS = {
 class WebhookPayload(BaseModel):
     secret: str
     symbol: str
-    action: str          # "BUY", "SELL", "CLOSE", "CANCEL_ENTRY"
+    action: str          # "BUY", "SELL", "CLOSE", "CANCEL_ENTRY", "UPDATE_SL"
     order_type: str      # "LIMIT", "MARKET", "CANCEL", "STOP_LIMIT"
     quantity: float
     price: float
@@ -129,6 +130,15 @@ async def cancel_resting_orders(symbol: str):
     except Exception as e:
         print(f"[CANCEL ERROR] {e}")
 
+async def cancel_single_order(symbol: str, order_id: str):
+    try:
+        params = {"symbol": symbol, "orderId": order_id}
+        status, data = await shark_request("DELETE", "/fapi/v1/order", params=params)
+        print(f"[CANCEL ORDER] id={order_id} status={status}")
+        return data
+    except Exception as e:
+        print(f"[CANCEL ORDER ERROR] {e}")
+
 async def place_order(symbol: str, side: str, order_type: str, qty: float, price: float = None, stop_price: float = None, reduce_only: bool = False):
     params = {
         "symbol": symbol,
@@ -162,7 +172,7 @@ async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: 
             positions = await get_position_state(symbol)
             if positions:
                 sl_side = "SELL" if side == "BUY" else "BUY"
-                status, _ = await place_order(
+                status, data = await place_order(
                     symbol=symbol,
                     side=sl_side,
                     order_type="STOP_MARKET",
@@ -170,6 +180,8 @@ async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: 
                     stop_price=sl_price,
                     reduce_only=True
                 )
+                if isinstance(data, dict) and "orderId" in data:
+                    active_sl_order_ids[symbol] = str(data["orderId"])
                 print(f"[SL ATTACHED] Placed Stop Market @ {sl_price}: status={status}")
                 return
     except asyncio.CancelledError:
@@ -197,13 +209,13 @@ async def receive_webhook(payload: WebhookPayload):
     
     print(f"[WEBHOOK] Action={payload.action} TradeID={payload.trade_id} Qty={payload.quantity} Price={payload.price} SL={payload.sl_price}")
     
-    if payload.trade_id == last_processed_trade_id:
+    if payload.action in ["BUY", "SELL"] and payload.trade_id == last_processed_trade_id:
         print(f"[DUPLICATE SIGNAL IGNORED] Trade ID {payload.trade_id} already executed.")
         return {"status": "ignored", "reason": "duplicate"}
     
     last_processed_trade_id = payload.trade_id
 
-    # 1. New Entry Signal
+    # 1. New Limit Entry Signal
     if payload.action in ["BUY", "SELL"] and payload.order_type == "LIMIT":
         stop_active_watcher(payload.symbol)
         await cancel_resting_orders(payload.symbol)
@@ -224,7 +236,34 @@ async def receive_webhook(payload: WebhookPayload):
         active_watcher_tasks[payload.symbol] = task
         return {"status": "limit_placed", "data": data}
 
-    # 2. Exit / Emergency Close Signal (TP, SL blowout, or Session end)
+    # 2. Dynamic Profit Lock / Trailing SL Update Signal
+    elif payload.action == "UPDATE_SL":
+        positions = await get_position_state(payload.symbol)
+        if positions:
+            pos_amt = float(positions[0].get("positionAmt", 0))
+            sl_side = "SELL" if pos_amt > 0 else "BUY"
+            
+            # Cancel old resting stop loss before setting the locked stop loss
+            if payload.symbol in active_sl_order_ids:
+                await cancel_single_order(payload.symbol, active_sl_order_ids[payload.symbol])
+            else:
+                await cancel_resting_orders(payload.symbol)
+            
+            status, data = await place_order(
+                symbol=payload.symbol,
+                side=sl_side,
+                order_type="STOP_MARKET",
+                qty=abs(pos_amt),
+                stop_price=payload.sl_price,
+                reduce_only=True
+            )
+            if isinstance(data, dict) and "orderId" in data:
+                active_sl_order_ids[payload.symbol] = str(data["orderId"])
+            print(f"[PROFIT LOCK APPLIED] Modified Stop Market to {payload.sl_price}: status={status}")
+            return {"status": "sl_updated", "data": data}
+        return {"status": "ignored", "reason": "no_open_position"}
+
+    # 3. Exit / Emergency Close Signal (Take Profit, Buffer Blowout, or Session End)
     elif payload.action == "CLOSE" or payload.order_type == "MARKET":
         stop_active_watcher(payload.symbol)
         positions = await get_position_state(payload.symbol)
@@ -245,7 +284,7 @@ async def receive_webhook(payload: WebhookPayload):
             print("[MARKET EXIT IGNORED] Position is already flat.")
             return {"status": "ignored", "reason": "already_flat"}
 
-    # 3. Cancel Pending Limit Signal
+    # 4. Cancel Pending Limit Signal
     elif payload.action == "CANCEL_ENTRY":
         stop_active_watcher(payload.symbol)
         await cancel_resting_orders(payload.symbol)
