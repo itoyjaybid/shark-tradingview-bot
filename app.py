@@ -190,7 +190,7 @@ async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: 
     print(f"[ENTRY WATCHER] Limit watcher timed out or cancelled.")
 
 # =============================================================================
-# LIFECYCLE & ROUTING
+# APPLICATION LIFECYCLE & ROUTING
 # =============================================================================
 @app.on_event("startup")
 async def startup_event():
@@ -204,18 +204,21 @@ def health_check():
 async def receive_webhook(payload: WebhookPayload):
     global last_processed_trade_id
     
+    # 1. Authenticate Secret
     if payload.secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     
     print(f"[WEBHOOK] Action={payload.action} TradeID={payload.trade_id} Qty={payload.quantity} Price={payload.price} SL={payload.sl_price}")
     
+    # Allow consecutive alerts for the same trade (e.g. UPDATE_SL, CLOSE),
+    # but block immediate duplicated deliveries of identical signals
     if payload.action in ["BUY", "SELL"] and payload.trade_id == last_processed_trade_id:
         print(f"[DUPLICATE SIGNAL IGNORED] Trade ID {payload.trade_id} already executed.")
         return {"status": "ignored", "reason": "duplicate"}
     
     last_processed_trade_id = payload.trade_id
 
-    # 1. New Limit Entry Signal
+    # 2. Limit Entry Signal (New Breakout or Immediate Post-Profit Retest)
     if payload.action in ["BUY", "SELL"] and payload.order_type == "LIMIT":
         stop_active_watcher(payload.symbol)
         await cancel_resting_orders(payload.symbol)
@@ -236,14 +239,14 @@ async def receive_webhook(payload: WebhookPayload):
         active_watcher_tasks[payload.symbol] = task
         return {"status": "limit_placed", "data": data}
 
-    # 2. Dynamic Profit Lock / Trailing SL Update Signal
+    # 3. Dynamic Profit Lock / Trailing SL Update Signal
     elif payload.action == "UPDATE_SL":
         positions = await get_position_state(payload.symbol)
         if positions:
             pos_amt = float(positions[0].get("positionAmt", 0))
             sl_side = "SELL" if pos_amt > 0 else "BUY"
             
-            # Cancel old resting stop loss before setting the locked stop loss
+            # Cancel old resting stop loss before replacing it with the locked level
             if payload.symbol in active_sl_order_ids:
                 await cancel_single_order(payload.symbol, active_sl_order_ids[payload.symbol])
             else:
@@ -263,7 +266,7 @@ async def receive_webhook(payload: WebhookPayload):
             return {"status": "sl_updated", "data": data}
         return {"status": "ignored", "reason": "no_open_position"}
 
-    # 3. Exit / Emergency Close Signal (Take Profit, Buffer Blowout, or Session End)
+    # 4. Exit / Emergency Close Signal (Target TP, Stop Loss, Buffer Blowout, or Session Close)
     elif payload.action == "CLOSE" or payload.order_type == "MARKET":
         stop_active_watcher(payload.symbol)
         positions = await get_position_state(payload.symbol)
@@ -284,7 +287,7 @@ async def receive_webhook(payload: WebhookPayload):
             print("[MARKET EXIT IGNORED] Position is already flat.")
             return {"status": "ignored", "reason": "already_flat"}
 
-    # 4. Cancel Pending Limit Signal
+    # 5. Cancel Pending Limit Signal (e.g., Session Reset)
     elif payload.action == "CANCEL_ENTRY":
         stop_active_watcher(payload.symbol)
         await cancel_resting_orders(payload.symbol)
