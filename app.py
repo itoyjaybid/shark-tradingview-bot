@@ -6,6 +6,7 @@ import hashlib
 import asyncio
 import urllib.request
 import urllib.error
+from email.utils import parsedate_to_datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -61,21 +62,35 @@ def generate_signature(query_string: str) -> str:
 
 def sync_server_clock():
     global clock_offset_ms
-    try:
-        req = urllib.request.Request(
-            f"{BASE_URL}/fapi/v1/time",
-            headers={"User-Agent": STANDARD_HEADERS["User-Agent"], "Accept": STANDARD_HEADERS["Accept"]},
-            method="GET"
-        )
-        with urllib.request.urlopen(req, timeout=5) as response:
-            if response.status == 200:
-                data = json.loads(response.read().decode("utf-8"))
-                server_time = data.get("serverTime", int(time.time() * 1000))
-                local_time = int(time.time() * 1000)
-                clock_offset_ms = server_time - local_time
-                print(f"[BOOT] Clock Offset = {clock_offset_ms}ms")
-    except Exception as e:
-        print(f"[BOOT] Failed to sync clock: {e}")
+    endpoints = [
+        f"{BASE_URL}/v1/market/ticker24Hr/btcusdt",
+        f"{BASE_URL}/fapi/v1/ticker/price?symbol=BTCUSDT"
+    ]
+    
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": STANDARD_HEADERS["User-Agent"],
+                    "Accept": STANDARD_HEADERS["Accept"]
+                },
+                method="GET"
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                date_hdr = response.headers.get("Date")
+                if date_hdr:
+                    server_dt = parsedate_to_datetime(date_hdr)
+                    server_ts = int(server_dt.timestamp() * 1000)
+                    local_ts = int(time.time() * 1000)
+                    clock_offset_ms = server_ts - local_ts
+                    print(f"[BOOT] Clock Offset synced via HTTP Date header: {clock_offset_ms}ms")
+                    return
+        except Exception:
+            continue
+            
+    print("[BOOT] Clock sync bypassed. Defaulting to local clock (Offset = 0ms)")
+    clock_offset_ms = 0
 
 def shark_request_sync(method: str, endpoint: str, params: dict = None, json_data: dict = None):
     if params is None:
@@ -204,21 +219,18 @@ def health_check():
 async def receive_webhook(payload: WebhookPayload):
     global last_processed_trade_id
     
-    # 1. Authenticate Secret
     if payload.secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     
     print(f"[WEBHOOK] Action={payload.action} TradeID={payload.trade_id} Qty={payload.quantity} Price={payload.price} SL={payload.sl_price}")
     
-    # Allow consecutive alerts for the same trade (e.g. UPDATE_SL, CLOSE),
-    # but block immediate duplicated deliveries of identical signals
     if payload.action in ["BUY", "SELL"] and payload.trade_id == last_processed_trade_id:
         print(f"[DUPLICATE SIGNAL IGNORED] Trade ID {payload.trade_id} already executed.")
         return {"status": "ignored", "reason": "duplicate"}
     
     last_processed_trade_id = payload.trade_id
 
-    # 2. Limit Entry Signal (New Breakout or Immediate Post-Profit Retest)
+    # 1. Limit Entry Signal
     if payload.action in ["BUY", "SELL"] and payload.order_type == "LIMIT":
         stop_active_watcher(payload.symbol)
         await cancel_resting_orders(payload.symbol)
@@ -239,14 +251,13 @@ async def receive_webhook(payload: WebhookPayload):
         active_watcher_tasks[payload.symbol] = task
         return {"status": "limit_placed", "data": data}
 
-    # 3. Dynamic Profit Lock / Trailing SL Update Signal
+    # 2. Dynamic Profit Lock / Trailing SL Update Signal
     elif payload.action == "UPDATE_SL":
         positions = await get_position_state(payload.symbol)
         if positions:
             pos_amt = float(positions[0].get("positionAmt", 0))
             sl_side = "SELL" if pos_amt > 0 else "BUY"
             
-            # Cancel old resting stop loss before replacing it with the locked level
             if payload.symbol in active_sl_order_ids:
                 await cancel_single_order(payload.symbol, active_sl_order_ids[payload.symbol])
             else:
@@ -266,7 +277,7 @@ async def receive_webhook(payload: WebhookPayload):
             return {"status": "sl_updated", "data": data}
         return {"status": "ignored", "reason": "no_open_position"}
 
-    # 4. Exit / Emergency Close Signal (Target TP, Stop Loss, Buffer Blowout, or Session Close)
+    # 3. Exit / Emergency Close Signal
     elif payload.action == "CLOSE" or payload.order_type == "MARKET":
         stop_active_watcher(payload.symbol)
         positions = await get_position_state(payload.symbol)
@@ -287,7 +298,7 @@ async def receive_webhook(payload: WebhookPayload):
             print("[MARKET EXIT IGNORED] Position is already flat.")
             return {"status": "ignored", "reason": "already_flat"}
 
-    # 5. Cancel Pending Limit Signal (e.g., Session Reset)
+    # 4. Cancel Pending Limit Signal
     elif payload.action == "CANCEL_ENTRY":
         stop_active_watcher(payload.symbol)
         await cancel_resting_orders(payload.symbol)
