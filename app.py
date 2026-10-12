@@ -24,11 +24,11 @@ BASE_URL = os.getenv("SHARK_BASE_URL", "https://api.sharkexchange.in")
 last_processed_trade_id: Optional[int] = None
 clock_offset_ms: int = 0
 active_watcher_tasks = {}
-active_sl_order_ids = {}
+active_sl_cids = {}
 
 STANDARD_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json",
+    "Accept": "*/*",
     "Content-Type": "application/json"
 }
 
@@ -48,64 +48,72 @@ class WebhookPayload(BaseModel):
     trade_id: int
 
 # =============================================================================
-# SHARK EXCHANGE UTILITIES
+# SHARK EXCHANGE SIGNATURE & API UTILITIES
 # =============================================================================
-def get_timestamp() -> int:
+def get_synced_time() -> int:
     return int(time.time() * 1000) + clock_offset_ms
 
-def generate_signature(query_string: str) -> str:
+def generate_signature(api_secret: str, data_to_sign: str) -> str:
     return hmac.new(
-        API_SECRET.encode("utf-8"),
-        query_string.encode("utf-8"),
+        api_secret.encode("utf-8"),
+        data_to_sign.encode("utf-8"),
         hashlib.sha256
     ).hexdigest()
 
+def clean_num(val: float, precision: int = 2):
+    rounded = round(float(val), precision)
+    return int(rounded) if rounded.is_integer() else rounded
+
+def clean_symbol(sym: str) -> str:
+    return sym.replace("-", "").replace("_", "").replace(".P", "").replace(".p", "").replace("/", "").upper()
+
 def sync_server_clock():
     global clock_offset_ms
-    endpoints = [
-        f"{BASE_URL}/v1/market/ticker24Hr/btcusdt",
-        f"{BASE_URL}/fapi/v1/ticker/price?symbol=BTCUSDT"
-    ]
-    
-    for url in endpoints:
-        try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": STANDARD_HEADERS["User-Agent"],
-                    "Accept": STANDARD_HEADERS["Accept"]
-                },
-                method="GET"
-            )
-            with urllib.request.urlopen(req, timeout=5) as response:
-                date_hdr = response.headers.get("Date")
-                if date_hdr:
-                    server_dt = parsedate_to_datetime(date_hdr)
-                    server_ts = int(server_dt.timestamp() * 1000)
-                    local_ts = int(time.time() * 1000)
-                    clock_offset_ms = server_ts - local_ts
-                    print(f"[BOOT] Clock Offset synced via HTTP Date header: {clock_offset_ms}ms")
-                    return
-        except Exception:
-            continue
-            
-    print("[BOOT] Clock sync bypassed. Defaulting to local clock (Offset = 0ms)")
+    url = f"{BASE_URL}/v1/market/ticker24Hr/btcusdt"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": STANDARD_HEADERS["User-Agent"]}, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            date_hdr = resp.headers.get("Date")
+            if date_hdr:
+                server_dt = parsedate_to_datetime(date_hdr)
+                server_ts = int(server_dt.timestamp() * 1000)
+                local_ts = int(time.time() * 1000)
+                clock_offset_ms = server_ts - local_ts
+                print(f"[BOOT] Clock Offset synced via HTTP Date: {clock_offset_ms}ms")
+                return
+    except Exception as e:
+        print(f"[BOOT] Clock sync notice: {e}")
     clock_offset_ms = 0
 
-def shark_request_sync(method: str, endpoint: str, params: dict = None, json_data: dict = None):
-    if params is None:
-        params = {}
+def shark_send_request(method: str, endpoint: str, query_params: dict = None, body_dict: dict = None):
+    ts = str(get_synced_time())
     
-    params["timestamp"] = get_timestamp()
-    query_str = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-    signature = generate_signature(query_str)
-    
-    url = f"{BASE_URL}{endpoint}?{query_str}&signature={signature}"
-    headers = {**STANDARD_HEADERS, "X-MBX-APIKEY": API_KEY}
-    
-    data_bytes = json.dumps(json_data).encode("utf-8") if json_data else None
+    if method.upper() in ["POST", "PATCH", "DELETE"]:
+        payload = body_dict or {}
+        payload["timestamp"] = ts
+        data_to_sign = json.dumps(payload, separators=(',', ':'))
+        sig = generate_signature(API_SECRET, data_to_sign)
+        headers = {
+            **STANDARD_HEADERS,
+            "api-key": API_KEY,
+            "signature": sig
+        }
+        url = f"{BASE_URL}{endpoint}"
+        data_bytes = data_to_sign.encode("utf-8")
+    else:
+        params = query_params or {}
+        params["timestamp"] = ts
+        query_str = "&".join(f"{k}={v}" for k, v in params.items())
+        sig = generate_signature(API_SECRET, query_str)
+        headers = {
+            **STANDARD_HEADERS,
+            "api-key": API_KEY,
+            "signature": sig
+        }
+        url = f"{BASE_URL}{endpoint}?{query_str}"
+        data_bytes = None
+
     req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method.upper())
-    
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             body = resp.read().decode("utf-8")
@@ -121,91 +129,102 @@ def shark_request_sync(method: str, endpoint: str, params: dict = None, json_dat
         print(f"[SHARK API REQ ERROR] {e}")
         return 500, {"error": str(e)}
 
-async def shark_request(method: str, endpoint: str, params: dict = None, json_data: dict = None):
-    return await asyncio.to_thread(shark_request_sync, method, endpoint, params, json_data)
+async def shark_call(method: str, endpoint: str, query_params: dict = None, body_dict: dict = None):
+    return await asyncio.to_thread(shark_send_request, method, endpoint, query_params, body_dict)
 
 # =============================================================================
-# EXCHANGE HELPERS
+# EXCHANGE OPERATIONS
 # =============================================================================
 async def get_position_state(symbol: str):
-    try:
-        status, data = await shark_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        if status == 200 and isinstance(data, list):
-            active = [p for p in data if abs(float(p.get("positionAmt", 0))) > 0]
-            return active
-    except Exception as e:
-        print(f"[POSITION ERROR] {e}")
-    return []
-
-async def cancel_resting_orders(symbol: str):
-    try:
-        status, data = await shark_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
-        print(f"[CANCEL ALL] symbol={symbol} status={status}")
-        return data
-    except Exception as e:
-        print(f"[CANCEL ERROR] {e}")
-
-async def cancel_single_order(symbol: str, order_id: str):
-    try:
-        params = {"symbol": symbol, "orderId": order_id}
-        status, data = await shark_request("DELETE", "/fapi/v1/order", params=params)
-        print(f"[CANCEL ORDER] id={order_id} status={status}")
-        return data
-    except Exception as e:
-        print(f"[CANCEL ORDER ERROR] {e}")
-
-async def place_order(symbol: str, side: str, order_type: str, qty: float, price: float = None, stop_price: float = None, reduce_only: bool = False):
+    target = clean_symbol(symbol)
     params = {
-        "symbol": symbol,
-        "side": side,
-        "type": order_type,
-        "quantity": qty
+        "sortOrder": "desc",
+        "pageSize": "100",
+        "symbol": target
     }
-    if reduce_only:
-        params["reduceOnly"] = "true"
-    if order_type == "LIMIT":
-        params["price"] = price
-        params["timeInForce"] = "GTC"
-    elif order_type in ["STOP_MARKET", "STOP"]:
-        params["stopPrice"] = stop_price
+    status, res = await shark_call("GET", "/v1/positions/OPEN", query_params=params)
+    if status != 200:
+        return []
+    
+    items = res if isinstance(res, list) else res.get("data", [])
+    if isinstance(items, dict):
+        items = [items]
+        
+    active_positions = []
+    for pos in items:
+        if not isinstance(pos, dict):
+            continue
+        sym = str(pos.get("contractPair") or pos.get("symbol") or "").upper()
+        if target in sym:
+            raw_qty = float(pos.get("positionAmount") or pos.get("quantity") or pos.get("positionAmt") or 0.0)
+            if abs(raw_qty) > 0.000001:
+                active_positions.append(pos)
+    return active_positions
 
-    return await shark_request("POST", "/fapi/v1/order", params=params)
+async def cancel_order(client_order_id: str):
+    if not client_order_id:
+        return
+    status, data = await shark_call("DELETE", "/v1/order/delete-order", body_dict={"clientOrderId": str(client_order_id)})
+    print(f"[CANCEL ORDER] cid={client_order_id} status={status}")
+    return data
+
+async def place_shark_order(symbol: str, side: str, order_type: str, qty: float, price: float = None, stop_price: float = None, reduce_only: bool = False):
+    target = clean_symbol(symbol)
+    payload = {
+        "deviceType": "WEB",
+        "marginAsset": "INR",
+        "placeType": "ORDER_FORM",
+        "quantity": clean_num(qty, 4),
+        "reduceOnly": reduce_only,
+        "side": side,
+        "symbol": target,
+        "type": order_type
+    }
+    if order_type == "LIMIT":
+        payload["price"] = clean_num(price, 2)
+    elif order_type == "STOP_LIMIT":
+        payload["stopPrice"] = clean_num(stop_price, 2)
+        payload["price"] = clean_num(price, 2)
+
+    return await shark_call("POST", "/v1/order/place-order", body_dict=payload)
 
 def stop_active_watcher(symbol: str):
     if symbol in active_watcher_tasks and not active_watcher_tasks[symbol].done():
         active_watcher_tasks[symbol].cancel()
-        print(f"[WATCHER CANCELLED] Stopped watcher task for {symbol}")
 
 # =============================================================================
 # BACKGROUND LIMIT ORDER WATCHER
 # =============================================================================
-async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: float, side: str, qty: float):
+async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: float, sl_buffer: float, side: str, qty: float):
     print(f"[ENTRY WATCHER] Monitoring Limit Order {client_order_id} until executed.")
     try:
         for _ in range(360):
-            await asyncio.sleep(5)
+            await asyncio.sleep(4)
             positions = await get_position_state(symbol)
             if positions:
                 sl_side = "SELL" if side == "BUY" else "BUY"
-                status, data = await place_order(
+                limit_price = (sl_price - sl_buffer) if sl_side == "SELL" else (sl_price + sl_buffer)
+                status, data = await place_shark_order(
                     symbol=symbol,
                     side=sl_side,
-                    order_type="STOP_MARKET",
+                    order_type="STOP_LIMIT",
                     qty=qty,
+                    price=limit_price,
                     stop_price=sl_price,
                     reduce_only=True
                 )
-                if isinstance(data, dict) and "orderId" in data:
-                    active_sl_order_ids[symbol] = str(data["orderId"])
-                print(f"[SL ATTACHED] Placed Stop Market @ {sl_price}: status={status}")
+                cid = data.get("clientOrderId") or data.get("data", {}).get("clientOrderId")
+                if cid:
+                    active_sl_cids[symbol] = str(cid)
+                print(f"[SL ATTACHED] Placed Stop Limit @ {sl_price} (Limit {limit_price}): status={status}")
                 return
     except asyncio.CancelledError:
-        print(f"[ENTRY WATCHER] Task successfully cancelled.")
+        print("[ENTRY WATCHER] Watcher cancelled.")
         return
-    print(f"[ENTRY WATCHER] Limit watcher timed out or cancelled.")
+    print("[ENTRY WATCHER] Timed out or cancelled.")
 
 # =============================================================================
-# APPLICATION LIFECYCLE & ROUTING
+# FASTAPI APPLICATION LIFECYCLE & ROUTES
 # =============================================================================
 @app.on_event("startup")
 async def startup_event():
@@ -222,7 +241,7 @@ async def receive_webhook(payload: WebhookPayload):
     if payload.secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     
-    print(f"[WEBHOOK] Action={payload.action} TradeID={payload.trade_id} Qty={payload.quantity} Price={payload.price} SL={payload.sl_price}")
+    print(f"[WEBHOOK] Action={payload.action} TradeID={payload.trade_id} Qty={payload.quantity} Price={payload.price} SL={payload.sl_price} Buffer={payload.sl_buffer}")
     
     if payload.action in ["BUY", "SELL"] and payload.trade_id == last_processed_trade_id:
         print(f"[DUPLICATE SIGNAL IGNORED] Trade ID {payload.trade_id} already executed.")
@@ -230,12 +249,11 @@ async def receive_webhook(payload: WebhookPayload):
     
     last_processed_trade_id = payload.trade_id
 
-    # 1. Limit Entry Signal
+    # 1. Limit Entry
     if payload.action in ["BUY", "SELL"] and payload.order_type == "LIMIT":
         stop_active_watcher(payload.symbol)
-        await cancel_resting_orders(payload.symbol)
         
-        status, data = await place_order(
+        status, data = await place_shark_order(
             symbol=payload.symbol,
             side=payload.action,
             order_type="LIMIT",
@@ -244,52 +262,62 @@ async def receive_webhook(payload: WebhookPayload):
         )
         print(f"[ORDER SUCCESS] status={status} data={data}")
         
-        client_id = data.get("clientOrderId", str(payload.trade_id)) if isinstance(data, dict) else str(payload.trade_id)
+        cid = data.get("clientOrderId") or data.get("data", {}).get("clientOrderId") or str(payload.trade_id)
         task = asyncio.create_task(
-            watch_limit_and_place_sl(payload.symbol, client_id, payload.sl_price, payload.action, payload.quantity)
+            watch_limit_and_place_sl(payload.symbol, cid, payload.sl_price, payload.sl_buffer, payload.action, payload.quantity)
         )
         active_watcher_tasks[payload.symbol] = task
         return {"status": "limit_placed", "data": data}
 
-    # 2. Dynamic Profit Lock / Trailing SL Update Signal
+    # 2. Dynamic Profit Lock / Trailing SL Update
     elif payload.action == "UPDATE_SL":
         positions = await get_position_state(payload.symbol)
         if positions:
-            pos_amt = float(positions[0].get("positionAmt", 0))
-            sl_side = "SELL" if pos_amt > 0 else "BUY"
+            pos = positions[0]
+            pos_amt = abs(float(pos.get("positionAmount") or pos.get("quantity") or 0.0))
+            pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
+            sl_side = "SELL" if "BUY" in pos_side else "BUY"
             
-            if payload.symbol in active_sl_order_ids:
-                await cancel_single_order(payload.symbol, active_sl_order_ids[payload.symbol])
-            else:
-                await cancel_resting_orders(payload.symbol)
+            # Cancel old resting stop loss
+            if payload.symbol in active_sl_cids:
+                await cancel_order(active_sl_cids[payload.symbol])
             
-            status, data = await place_order(
+            limit_price = (payload.sl_price - payload.sl_buffer) if sl_side == "SELL" else (payload.sl_price + payload.sl_buffer)
+            status, data = await place_shark_order(
                 symbol=payload.symbol,
                 side=sl_side,
-                order_type="STOP_MARKET",
-                qty=abs(pos_amt),
+                order_type="STOP_LIMIT",
+                qty=pos_amt,
+                price=limit_price,
                 stop_price=payload.sl_price,
                 reduce_only=True
             )
-            if isinstance(data, dict) and "orderId" in data:
-                active_sl_order_ids[payload.symbol] = str(data["orderId"])
-            print(f"[PROFIT LOCK APPLIED] Modified Stop Market to {payload.sl_price}: status={status}")
+            cid = data.get("clientOrderId") or data.get("data", {}).get("clientOrderId")
+            if cid:
+                active_sl_cids[payload.symbol] = str(cid)
+            print(f"[PROFIT LOCK APPLIED] Modified Stop Limit to {payload.sl_price}: status={status}")
             return {"status": "sl_updated", "data": data}
         return {"status": "ignored", "reason": "no_open_position"}
 
-    # 3. Exit / Emergency Close Signal
+    # 3. Market Exit / Emergency Close
     elif payload.action == "CLOSE" or payload.order_type == "MARKET":
         stop_active_watcher(payload.symbol)
+        
+        if payload.symbol in active_sl_cids:
+            await cancel_order(active_sl_cids[payload.symbol])
+            
         positions = await get_position_state(payload.symbol)
         if positions:
-            pos_amt = float(positions[0].get("positionAmt", 0))
-            close_side = "SELL" if pos_amt > 0 else "BUY"
-            await cancel_resting_orders(payload.symbol)
-            status, data = await place_order(
+            pos = positions[0]
+            pos_amt = abs(float(pos.get("positionAmount") or pos.get("quantity") or 0.0))
+            pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
+            close_side = "SELL" if "BUY" in pos_side else "BUY"
+            
+            status, data = await place_shark_order(
                 symbol=payload.symbol,
                 side=close_side,
                 order_type="MARKET",
-                qty=abs(pos_amt),
+                qty=pos_amt,
                 reduce_only=True
             )
             print(f"[MARKET EXIT] Closed position of {pos_amt} {payload.symbol}")
@@ -298,10 +326,9 @@ async def receive_webhook(payload: WebhookPayload):
             print("[MARKET EXIT IGNORED] Position is already flat.")
             return {"status": "ignored", "reason": "already_flat"}
 
-    # 4. Cancel Pending Limit Signal
+    # 4. Cancel Pending Entry
     elif payload.action == "CANCEL_ENTRY":
         stop_active_watcher(payload.symbol)
-        await cancel_resting_orders(payload.symbol)
         return {"status": "cancelled"}
 
     return {"status": "unhandled_action"}
