@@ -25,6 +25,13 @@ last_processed_trade_id: Optional[int] = None
 clock_offset_ms: int = 0
 active_watcher_tasks = {}
 
+# Standard browser headers to bypass Cloudflare / WAF 403 Forbidden
+STANDARD_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+}
+
 # =============================================================================
 # SCHEMAS
 # =============================================================================
@@ -41,7 +48,7 @@ class WebhookPayload(BaseModel):
     trade_id: int
 
 # =============================================================================
-# SHARK EXCHANGE SIGNATURE & API UTILITIES (Standard Library urllib)
+# SHARK EXCHANGE SIGNATURE & API UTILITIES
 # =============================================================================
 def get_timestamp() -> int:
     return int(time.time() * 1000) + clock_offset_ms
@@ -56,7 +63,14 @@ def generate_signature(query_string: str) -> str:
 def sync_server_clock():
     global clock_offset_ms
     try:
-        req = urllib.request.Request(f"{BASE_URL}/api/v1/time", method="GET")
+        req = urllib.request.Request(
+            f"{BASE_URL}/api/v1/time",
+            headers={
+                "User-Agent": STANDARD_HEADERS["User-Agent"],
+                "Accept": STANDARD_HEADERS["Accept"]
+            },
+            method="GET"
+        )
         with urllib.request.urlopen(req, timeout=5) as response:
             if response.status == 200:
                 data = json.loads(response.read().decode("utf-8"))
@@ -77,8 +91,8 @@ def shark_request_sync(method: str, endpoint: str, params: dict = None, json_dat
     
     url = f"{BASE_URL}{endpoint}?{query_str}&signature={signature}"
     headers = {
-        "X-MBX-APIKEY": API_KEY,
-        "Content-Type": "application/json"
+        **STANDARD_HEADERS,
+        "X-MBX-APIKEY": API_KEY
     }
     
     data_bytes = None
@@ -149,7 +163,7 @@ async def place_order(symbol: str, side: str, order_type: str, qty: float, price
 # =============================================================================
 async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: float, side: str, qty: float):
     print(f"[ENTRY WATCHER] Monitoring Limit Order {client_order_id} until executed.")
-    for _ in range(360):
+    for _ in range(360):  # Monitor for up to 30 minutes
         await asyncio.sleep(5)
         positions = await get_position_state(symbol)
         if positions:
@@ -172,7 +186,8 @@ async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: 
 async def startup_event():
     await asyncio.to_thread(sync_server_clock)
 
-@app.get("/")
+# Handles both GET and HEAD requests to resolve Render health check 405s
+@app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "live", "offset_ms": clock_offset_ms}
 
