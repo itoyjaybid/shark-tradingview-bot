@@ -24,6 +24,7 @@ BASE_URL = os.getenv("SHARK_BASE_URL", "https://api.sharkexchange.in")
 last_processed_trade_id: Optional[int] = None
 clock_offset_ms: int = 0
 active_watcher_tasks = {}
+active_limit_cids = {}
 active_sl_cids = {}
 
 STANDARD_HEADERS = {
@@ -191,14 +192,15 @@ async def place_shark_order(symbol: str, side: str, order_type: str, qty: float,
 def stop_active_watcher(symbol: str):
     if symbol in active_watcher_tasks and not active_watcher_tasks[symbol].done():
         active_watcher_tasks[symbol].cancel()
+        print(f"[WATCHER TERMINATED] Stopped monitoring loop for {symbol}")
 
 # =============================================================================
-# BACKGROUND LIMIT ORDER WATCHER
+# PERSISTENT LIMIT ORDER WATCHER (RUNS UNTIL FILLED OR EXITED)
 # =============================================================================
 async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: float, sl_buffer: float, side: str, qty: float):
-    print(f"[ENTRY WATCHER] Monitoring Limit Order {client_order_id} until executed.")
+    print(f"[ENTRY WATCHER] Persistent monitor started for Limit Order {client_order_id}.")
     try:
-        for _ in range(360):
+        while True:
             await asyncio.sleep(4)
             positions = await get_position_state(symbol)
             if positions:
@@ -216,15 +218,16 @@ async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: 
                 cid = data.get("clientOrderId") or data.get("data", {}).get("clientOrderId")
                 if cid:
                     active_sl_cids[symbol] = str(cid)
-                print(f"[SL ATTACHED] Placed Stop Limit @ {sl_price} (Limit {limit_price}): status={status}")
+                print(f"[SL ATTACHED] Fill detected! Placed Stop Limit @ {sl_price} (Limit {limit_price}): status={status}")
                 return
     except asyncio.CancelledError:
-        print("[ENTRY WATCHER] Watcher cancelled.")
+        print(f"[ENTRY WATCHER] Watcher task cancelled.")
         return
-    print("[ENTRY WATCHER] Timed out or cancelled.")
+    except Exception as e:
+        print(f"[ENTRY WATCHER ERROR] {e}")
 
 # =============================================================================
-# FASTAPI APPLICATION LIFECYCLE & ROUTES
+# APPLICATION LIFECYCLE & ROUTES
 # =============================================================================
 @app.on_event("startup")
 async def startup_event():
@@ -244,15 +247,18 @@ async def receive_webhook(payload: WebhookPayload):
     print(f"[WEBHOOK] Action={payload.action} TradeID={payload.trade_id} Qty={payload.quantity} Price={payload.price} SL={payload.sl_price} Buffer={payload.sl_buffer}")
     
     if payload.action in ["BUY", "SELL"] and payload.trade_id == last_processed_trade_id:
-        print(f"[DUPLICATE SIGNAL IGNORED] Trade ID {payload.trade_id} already executed.")
+        print(f"[DUPLICATE SIGNAL IGNORED] Trade ID {payload.trade_id} already processed.")
         return {"status": "ignored", "reason": "duplicate"}
     
     last_processed_trade_id = payload.trade_id
 
-    # 1. Limit Entry
+    # 1. Limit Entry (New Breakout or Immediate Retest)
     if payload.action in ["BUY", "SELL"] and payload.order_type == "LIMIT":
         stop_active_watcher(payload.symbol)
         
+        if payload.symbol in active_limit_cids:
+            await cancel_order(active_limit_cids[payload.symbol])
+            
         status, data = await place_shark_order(
             symbol=payload.symbol,
             side=payload.action,
@@ -263,6 +269,9 @@ async def receive_webhook(payload: WebhookPayload):
         print(f"[ORDER SUCCESS] status={status} data={data}")
         
         cid = data.get("clientOrderId") or data.get("data", {}).get("clientOrderId") or str(payload.trade_id)
+        active_limit_cids[payload.symbol] = str(cid)
+        
+        # Spawns a persistent watcher loop
         task = asyncio.create_task(
             watch_limit_and_place_sl(payload.symbol, cid, payload.sl_price, payload.sl_buffer, payload.action, payload.quantity)
         )
@@ -278,7 +287,6 @@ async def receive_webhook(payload: WebhookPayload):
             pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
             sl_side = "SELL" if "BUY" in pos_side else "BUY"
             
-            # Cancel old resting stop loss
             if payload.symbol in active_sl_cids:
                 await cancel_order(active_sl_cids[payload.symbol])
             
@@ -304,7 +312,10 @@ async def receive_webhook(payload: WebhookPayload):
         stop_active_watcher(payload.symbol)
         
         if payload.symbol in active_sl_cids:
-            await cancel_order(active_sl_cids[payload.symbol])
+            await cancel_order(active_sl_cids.pop(payload.symbol))
+            
+        if payload.symbol in active_limit_cids:
+            await cancel_order(active_limit_cids.pop(payload.symbol))
             
         positions = await get_position_state(payload.symbol)
         if positions:
@@ -329,6 +340,8 @@ async def receive_webhook(payload: WebhookPayload):
     # 4. Cancel Pending Entry
     elif payload.action == "CANCEL_ENTRY":
         stop_active_watcher(payload.symbol)
+        if payload.symbol in active_limit_cids:
+            await cancel_order(active_limit_cids.pop(payload.symbol))
         return {"status": "cancelled"}
 
     return {"status": "unhandled_action"}
