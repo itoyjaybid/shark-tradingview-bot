@@ -20,12 +20,10 @@ API_KEY = os.getenv("SHARK_API_KEY", "")
 API_SECRET = os.getenv("SHARK_API_SECRET", "")
 BASE_URL = os.getenv("SHARK_BASE_URL", "https://api.sharkexchange.in")
 
-# In-memory tracking
 last_processed_trade_id: Optional[int] = None
 clock_offset_ms: int = 0
 active_watcher_tasks = {}
 
-# Standard browser headers to bypass Cloudflare / WAF 403 Forbidden
 STANDARD_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json",
@@ -38,17 +36,17 @@ STANDARD_HEADERS = {
 class WebhookPayload(BaseModel):
     secret: str
     symbol: str
-    action: str          # "BUY", "SELL", "CLOSE", "CANCEL_ENTRY", "UPDATE_SL"
+    action: str          # "BUY", "SELL", "CLOSE", "CANCEL_ENTRY"
     order_type: str      # "LIMIT", "MARKET", "CANCEL", "STOP_LIMIT"
     quantity: float
     price: float
     sl_price: float
     sl_buffer: float
-    position_side: str   # "BUY", "SELL", "NONE"
+    position_side: str
     trade_id: int
 
 # =============================================================================
-# SHARK EXCHANGE SIGNATURE & API UTILITIES
+# SHARK EXCHANGE UTILITIES
 # =============================================================================
 def get_timestamp() -> int:
     return int(time.time() * 1000) + clock_offset_ms
@@ -64,11 +62,8 @@ def sync_server_clock():
     global clock_offset_ms
     try:
         req = urllib.request.Request(
-            f"{BASE_URL}/api/v1/time",
-            headers={
-                "User-Agent": STANDARD_HEADERS["User-Agent"],
-                "Accept": STANDARD_HEADERS["Accept"]
-            },
+            f"{BASE_URL}/fapi/v1/time",
+            headers={"User-Agent": STANDARD_HEADERS["User-Agent"], "Accept": STANDARD_HEADERS["Accept"]},
             method="GET"
         )
         with urllib.request.urlopen(req, timeout=5) as response:
@@ -90,15 +85,9 @@ def shark_request_sync(method: str, endpoint: str, params: dict = None, json_dat
     signature = generate_signature(query_str)
     
     url = f"{BASE_URL}{endpoint}?{query_str}&signature={signature}"
-    headers = {
-        **STANDARD_HEADERS,
-        "X-MBX-APIKEY": API_KEY
-    }
+    headers = {**STANDARD_HEADERS, "X-MBX-APIKEY": API_KEY}
     
-    data_bytes = None
-    if json_data is not None:
-        data_bytes = json.dumps(json_data).encode("utf-8")
-        
+    data_bytes = json.dumps(json_data).encode("utf-8") if json_data else None
     req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method.upper())
     
     try:
@@ -123,19 +112,16 @@ async def shark_request(method: str, endpoint: str, params: dict = None, json_da
 # EXCHANGE HELPERS
 # =============================================================================
 async def get_position_state(symbol: str):
-    """Returns currently open positions for the symbol."""
     try:
         status, data = await shark_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
         if status == 200 and isinstance(data, list):
             active = [p for p in data if abs(float(p.get("positionAmt", 0))) > 0]
-            print(f"[POSITION RAW] target={symbol} -> {active}")
             return active
     except Exception as e:
         print(f"[POSITION ERROR] {e}")
     return []
 
 async def cancel_resting_orders(symbol: str):
-    """Cancels all open orders for the symbol."""
     try:
         status, data = await shark_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
         print(f"[CANCEL ALL] symbol={symbol} status={status}")
@@ -143,13 +129,15 @@ async def cancel_resting_orders(symbol: str):
     except Exception as e:
         print(f"[CANCEL ERROR] {e}")
 
-async def place_order(symbol: str, side: str, order_type: str, qty: float, price: float = None, stop_price: float = None):
+async def place_order(symbol: str, side: str, order_type: str, qty: float, price: float = None, stop_price: float = None, reduce_only: bool = False):
     params = {
         "symbol": symbol,
         "side": side,
         "type": order_type,
         "quantity": qty
     }
+    if reduce_only:
+        params["reduceOnly"] = "true"
     if order_type == "LIMIT":
         params["price"] = price
         params["timeInForce"] = "GTC"
@@ -158,35 +146,44 @@ async def place_order(symbol: str, side: str, order_type: str, qty: float, price
 
     return await shark_request("POST", "/fapi/v1/order", params=params)
 
+def stop_active_watcher(symbol: str):
+    if symbol in active_watcher_tasks and not active_watcher_tasks[symbol].done():
+        active_watcher_tasks[symbol].cancel()
+        print(f"[WATCHER CANCELLED] Stopped watcher task for {symbol}")
+
 # =============================================================================
 # BACKGROUND LIMIT ORDER WATCHER
 # =============================================================================
 async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: float, side: str, qty: float):
     print(f"[ENTRY WATCHER] Monitoring Limit Order {client_order_id} until executed.")
-    for _ in range(360):  # Monitor for up to 30 minutes
-        await asyncio.sleep(5)
-        positions = await get_position_state(symbol)
-        if positions:
-            sl_side = "SELL" if side == "BUY" else "BUY"
-            status, _ = await place_order(
-                symbol=symbol,
-                side=sl_side,
-                order_type="STOP_MARKET",
-                qty=qty,
-                stop_price=sl_price
-            )
-            print(f"[SL ATTACHED] Placed Stop Market @ {sl_price}: status={status}")
-            return
-    print(f"[ENTRY WATCHER] Order cancelled or superseded.")
+    try:
+        for _ in range(360):
+            await asyncio.sleep(5)
+            positions = await get_position_state(symbol)
+            if positions:
+                sl_side = "SELL" if side == "BUY" else "BUY"
+                status, _ = await place_order(
+                    symbol=symbol,
+                    side=sl_side,
+                    order_type="STOP_MARKET",
+                    qty=qty,
+                    stop_price=sl_price,
+                    reduce_only=True
+                )
+                print(f"[SL ATTACHED] Placed Stop Market @ {sl_price}: status={status}")
+                return
+    except asyncio.CancelledError:
+        print(f"[ENTRY WATCHER] Task successfully cancelled.")
+        return
+    print(f"[ENTRY WATCHER] Limit watcher timed out or cancelled.")
 
 # =============================================================================
-# APPLICATION LIFECYCLE & WEBHOOK ROUTE
+# LIFECYCLE & ROUTING
 # =============================================================================
 @app.on_event("startup")
 async def startup_event():
     await asyncio.to_thread(sync_server_clock)
 
-# Handles both GET and HEAD requests to resolve Render health check 405s
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "live", "offset_ms": clock_offset_ms}
@@ -195,21 +192,20 @@ def health_check():
 async def receive_webhook(payload: WebhookPayload):
     global last_processed_trade_id
     
-    # 1. Authenticate Secret
     if payload.secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     
-    print(f"[WEBHOOK] Action={payload.action} TradeID={payload.trade_id} Qty={payload.quantity} Price={payload.price} SL={payload.sl_price} Buffer={payload.sl_buffer}")
+    print(f"[WEBHOOK] Action={payload.action} TradeID={payload.trade_id} Qty={payload.quantity} Price={payload.price} SL={payload.sl_price}")
     
-    # 2. Duplicate Check: Block only if identical to the immediate preceding trade
     if payload.trade_id == last_processed_trade_id:
         print(f"[DUPLICATE SIGNAL IGNORED] Trade ID {payload.trade_id} already executed.")
         return {"status": "ignored", "reason": "duplicate"}
     
     last_processed_trade_id = payload.trade_id
 
-    # 3. Process Execution Actions
+    # 1. New Entry Signal
     if payload.action in ["BUY", "SELL"] and payload.order_type == "LIMIT":
+        stop_active_watcher(payload.symbol)
         await cancel_resting_orders(payload.symbol)
         
         status, data = await place_order(
@@ -219,7 +215,6 @@ async def receive_webhook(payload: WebhookPayload):
             qty=payload.quantity,
             price=payload.price
         )
-        
         print(f"[ORDER SUCCESS] status={status} data={data}")
         
         client_id = data.get("clientOrderId", str(payload.trade_id)) if isinstance(data, dict) else str(payload.trade_id)
@@ -229,7 +224,9 @@ async def receive_webhook(payload: WebhookPayload):
         active_watcher_tasks[payload.symbol] = task
         return {"status": "limit_placed", "data": data}
 
+    # 2. Exit / Emergency Close Signal (TP, SL blowout, or Session end)
     elif payload.action == "CLOSE" or payload.order_type == "MARKET":
+        stop_active_watcher(payload.symbol)
         positions = await get_position_state(payload.symbol)
         if positions:
             pos_amt = float(positions[0].get("positionAmt", 0))
@@ -239,7 +236,8 @@ async def receive_webhook(payload: WebhookPayload):
                 symbol=payload.symbol,
                 side=close_side,
                 order_type="MARKET",
-                qty=abs(pos_amt)
+                qty=abs(pos_amt),
+                reduce_only=True
             )
             print(f"[MARKET EXIT] Closed position of {pos_amt} {payload.symbol}")
             return {"status": "closed", "data": data}
@@ -247,7 +245,9 @@ async def receive_webhook(payload: WebhookPayload):
             print("[MARKET EXIT IGNORED] Position is already flat.")
             return {"status": "ignored", "reason": "already_flat"}
 
+    # 3. Cancel Pending Limit Signal
     elif payload.action == "CANCEL_ENTRY":
+        stop_active_watcher(payload.symbol)
         await cancel_resting_orders(payload.symbol)
         return {"status": "cancelled"}
 
