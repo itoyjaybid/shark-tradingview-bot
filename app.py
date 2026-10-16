@@ -188,7 +188,7 @@ async def get_position_state(symbol: str):
         sym = str(pos.get("contractPair") or pos.get("symbol") or "").upper()
         if target in sym:
             raw_qty = float(pos.get("positionAmount") or pos.get("quantity") or pos.get("positionAmt") or 0.0)
-            if abs(raw_qty) > 0.000001:
+            if abs(raw_qty) > 0.0001:
                 active_positions.append(pos)
     return active_positions
 
@@ -232,7 +232,7 @@ def stop_active_watcher(symbol: str):
         print(f"[WATCHER TERMINATED] Stopped monitoring loop for {symbol}", flush=True)
 
 # =============================================================================
-# PERSISTENT LIMIT ORDER WATCHER (FAST 1.5S LOOP WITH UNBUFFERED OUTPUT)
+# PERSISTENT LIMIT ORDER WATCHER
 # =============================================================================
 async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: float, sl_buffer: float, side: str, qty: float):
     print(f"[ENTRY WATCHER] Persistent monitor started for Limit Order {client_order_id}.", flush=True)
@@ -276,7 +276,6 @@ def health_check():
 
 @app.post("/webhook")
 async def receive_webhook(payload: WebhookPayload):
-    # Verify secret if configured
     expected_secret = WEBHOOK_SECRET
     provided_secret = payload.get_secret()
     if expected_secret and expected_secret != "MY_SECRET_KEY" and provided_secret != expected_secret:
@@ -334,29 +333,32 @@ async def receive_webhook(payload: WebhookPayload):
             positions = await get_position_state(symbol)
             if positions:
                 pos = positions[0]
-                pos_amt = abs(float(pos.get("positionAmount") or pos.get("quantity") or 0.0))
-                pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
-                sl_side = "SELL" if "BUY" in pos_side else "BUY"
+                pos_amt = abs(float(pos.get("positionAmount") or pos.get("quantity") or pos.get("positionAmt") or 0.0))
                 
-                if symbol in active_sl_cids:
-                    await cancel_order(active_sl_cids.pop(symbol))
-                
-                limit_price = (sl_price - sl_buffer) if sl_side == "SELL" else (sl_price + sl_buffer)
-                status, data = await place_shark_order(
-                    symbol=symbol,
-                    side=sl_side,
-                    order_type="STOP_LIMIT",
-                    qty=pos_amt,
-                    price=limit_price,
-                    stop_price=sl_price,
-                    reduce_only=True
-                )
-                cid = data.get("clientOrderId") or data.get("data", {}).get("clientOrderId")
-                if cid:
-                    active_sl_cids[symbol] = str(cid)
-                print(f"[PROFIT LOCK APPLIED] Modified Stop Limit to {sl_price}: status={status}", flush=True)
-                return {"status": "sl_updated", "data": data}
-            print(f"[UPDATE_SL IGNORED] No open position for {symbol}", flush=True)
+                if pos_amt > 0.0001:
+                    pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
+                    sl_side = "SELL" if "BUY" in pos_side else "BUY"
+                    
+                    if symbol in active_sl_cids:
+                        await cancel_order(active_sl_cids.pop(symbol))
+                    
+                    limit_price = (sl_price - sl_buffer) if sl_side == "SELL" else (sl_price + sl_buffer)
+                    status, data = await place_shark_order(
+                        symbol=symbol,
+                        side=sl_side,
+                        order_type="STOP_LIMIT",
+                        qty=pos_amt,
+                        price=limit_price,
+                        stop_price=sl_price,
+                        reduce_only=True
+                    )
+                    cid = data.get("clientOrderId") or data.get("data", {}).get("clientOrderId")
+                    if cid:
+                        active_sl_cids[symbol] = str(cid)
+                    print(f"[PROFIT LOCK APPLIED] Modified Stop Limit to {sl_price}: status={status}", flush=True)
+                    return {"status": "sl_updated", "data": data}
+            
+            print(f"[UPDATE_SL IGNORED] No active position for {symbol}", flush=True)
             return {"status": "ignored", "reason": "no_open_position"}
 
         # 3. Market Exit / Emergency Close
@@ -367,19 +369,25 @@ async def receive_webhook(payload: WebhookPayload):
             positions = await get_position_state(symbol)
             if positions:
                 pos = positions[0]
-                pos_amt = abs(float(pos.get("positionAmount") or pos.get("quantity") or 0.0))
-                pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
-                close_side = "SELL" if "BUY" in pos_side else "BUY"
+                pos_amt = abs(float(pos.get("positionAmount") or pos.get("quantity") or pos.get("positionAmt") or 0.0))
                 
-                status, data = await place_shark_order(
-                    symbol=symbol,
-                    side=close_side,
-                    order_type="MARKET",
-                    qty=pos_amt,
-                    reduce_only=True
-                )
-                print(f"[MARKET EXIT] Closed position of {pos_amt} {symbol}", flush=True)
-                return {"status": "closed", "data": data}
+                # Check that position is truly open before submitting market close
+                if pos_amt > 0.0001:
+                    pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
+                    close_side = "SELL" if "BUY" in pos_side else "BUY"
+                    
+                    status, data = await place_shark_order(
+                        symbol=symbol,
+                        side=close_side,
+                        order_type="MARKET",
+                        qty=pos_amt,
+                        reduce_only=True
+                    )
+                    print(f"[MARKET EXIT] Closed position of {pos_amt} {symbol}", flush=True)
+                    return {"status": "closed", "data": data}
+                else:
+                    print("[MARKET EXIT IGNORED] Position is already 0 (likely closed by resting Stop Limit).", flush=True)
+                    return {"status": "ignored", "reason": "already_flat"}
             else:
                 print("[MARKET EXIT IGNORED] Position is already flat.", flush=True)
                 return {"status": "ignored", "reason": "already_flat"}
