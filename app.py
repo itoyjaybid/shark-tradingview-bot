@@ -37,7 +37,7 @@ STANDARD_HEADERS = {
 }
 
 # =============================================================================
-# FLEXIBLE SCHEMAS (ACCEPTS BOTH OLD & NEW PINE SCRIPT KEYS TO PREVENT 422)
+# FLEXIBLE SCHEMAS
 # =============================================================================
 class WebhookPayload(BaseModel):
     secret: Optional[str] = None
@@ -152,7 +152,6 @@ def shark_send_request(method: str, endpoint: str, query_params: dict = None, bo
             parsed_err = json.loads(body)
         except Exception:
             parsed_err = {"error": body}
-        # Ignore 3060 (Order not found) quietly
         if err.code != 400 or str(parsed_err.get("error")) != "3060":
             print(f"[SHARK API HTTP ERROR] {err.code}: {body}", flush=True)
         return err.code, parsed_err
@@ -164,7 +163,7 @@ async def shark_call(method: str, endpoint: str, query_params: dict = None, body
     return await asyncio.to_thread(shark_send_request, method, endpoint, query_params, body_dict)
 
 # =============================================================================
-# EXCHANGE OPERATIONS
+# EXCHANGE OPERATIONS & TOTAL PURGING
 # =============================================================================
 async def get_position_state(symbol: str):
     target = clean_symbol(symbol)
@@ -200,11 +199,26 @@ async def cancel_order(client_order_id: str):
         print(f"[CANCEL ORDER] cid={client_order_id} status={status}", flush=True)
     return data
 
+async def cancel_all_exchange_open_orders(symbol: str):
+    """Directly queries Shark orderbook and cancels every resting limit/stop order."""
+    target = clean_symbol(symbol)
+    status, res = await shark_call("GET", "/v1/order/open-orders", query_params={"symbol": target, "pageSize": "100"})
+    if status == 200:
+        orders = res if isinstance(res, list) else res.get("data", [])
+        if isinstance(orders, dict):
+            orders = [orders]
+        for ord_item in orders:
+            cid = ord_item.get("clientOrderId") or ord_item.get("id")
+            if cid:
+                await cancel_order(str(cid))
+                print(f"[PURGED ORDER] Cancelled open order {cid} on {target}", flush=True)
+
 async def cancel_all_tracked_orders(symbol: str):
     if symbol in active_sl_cids:
         await cancel_order(active_sl_cids.pop(symbol))
     if symbol in active_limit_cids:
         await cancel_order(active_limit_cids.pop(symbol))
+    await cancel_all_exchange_open_orders(symbol)
 
 async def place_shark_order(symbol: str, side: str, order_type: str, qty: float, price: float = None, stop_price: float = None, reduce_only: bool = False):
     target = clean_symbol(symbol)
@@ -232,12 +246,14 @@ def stop_active_watcher(symbol: str):
         print(f"[WATCHER TERMINATED] Stopped monitoring loop for {symbol}", flush=True)
 
 # =============================================================================
-# PERSISTENT LIMIT ORDER WATCHER
+# CONTINUOUS LIFECYCLE WATCHER (Entry Monitor + Manual Exit Flat Guard)
 # =============================================================================
 async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: float, sl_buffer: float, side: str, qty: float):
-    print(f"[ENTRY WATCHER] Persistent monitor started for Limit Order {client_order_id}.", flush=True)
+    print(f"[LIFECYCLE WATCHER] Started monitoring loop for {symbol} (Order {client_order_id}).", flush=True)
+    sl_placed = False
     try:
-        while True:
+        # Phase 1: Wait for entry fill, then place Stop-Limit
+        while not sl_placed:
             await asyncio.sleep(1.5)
             positions = await get_position_state(symbol)
             if positions:
@@ -256,15 +272,29 @@ async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: 
                 if cid:
                     active_sl_cids[symbol] = str(cid)
                 print(f"[SL ATTACHED] Fill detected! Placed Stop Limit @ {sl_price} (Limit {limit_price}): status={status}", flush=True)
+                sl_placed = True
+
+        # Phase 2: Active Trade Monitor — Auto-purge if closed manually on exchange
+        print(f"[ACTIVE POSITION GUARD] Monitoring {symbol} position. Will auto-cancel SL if closed manually.", flush=True)
+        while True:
+            await asyncio.sleep(2.0)
+            positions = await get_position_state(symbol)
+            # If position was closed manually on Shark Exchange, positions becomes empty
+            if not positions:
+                print(f"[MANUAL EXIT DETECTED] Position is flat! Auto-cancelling all resting SL/buffers on {symbol}...", flush=True)
+                await cancel_all_exchange_open_orders(symbol)
+                if symbol in active_sl_cids:
+                    del active_sl_cids[symbol]
                 return
+
     except asyncio.CancelledError:
-        print(f"[ENTRY WATCHER] Watcher task cancelled.", flush=True)
+        print(f"[LIFECYCLE WATCHER] Task cancelled cleanly.", flush=True)
         return
     except Exception as e:
-        print(f"[ENTRY WATCHER ERROR] {e}", flush=True)
+        print(f"[LIFECYCLE WATCHER ERROR] {e}", flush=True)
 
 # =============================================================================
-# APPLICATION LIFECYCLE & ROUTES
+# APPLICATION ROUTES
 # =============================================================================
 @app.on_event("startup")
 async def startup_event():
@@ -273,6 +303,12 @@ async def startup_event():
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "live", "offset_ms": clock_offset_ms}
+
+@app.get("/purge")
+async def manual_purge(symbol: str = "BTCUSDT"):
+    stop_active_watcher(symbol)
+    await cancel_all_tracked_orders(symbol)
+    return {"status": "purged", "symbol": symbol}
 
 @app.post("/webhook")
 async def receive_webhook(payload: WebhookPayload):
@@ -297,7 +333,6 @@ async def receive_webhook(payload: WebhookPayload):
         return {"status": "ignored", "reason": "duplicate"}
     recent_actions[dedup_key] = now
 
-    # Housekeeping: prune old deduplication records
     for k in list(recent_actions.keys()):
         if now - recent_actions[k] > 60.0:
             del recent_actions[k]
@@ -305,7 +340,7 @@ async def receive_webhook(payload: WebhookPayload):
     print(f"[WEBHOOK] Action={action} TradeID={trade_id} Qty={qty} Price={price} SL={sl_price} Buffer={sl_buffer}", flush=True)
 
     async with action_lock:
-        # 1. Limit Entry
+        # 1. Limit Entry Order
         if action in ["BUY", "SELL"] and payload.order_type in ["LIMIT", None]:
             stop_active_watcher(symbol)
             await cancel_all_tracked_orders(symbol)
@@ -328,7 +363,7 @@ async def receive_webhook(payload: WebhookPayload):
             active_watcher_tasks[symbol] = task
             return {"status": "limit_placed", "data": data}
 
-        # 2. Dynamic Profit Lock / Trailing SL Update
+        # 2. Dynamic Trailing SL / Profit Lock
         elif action == "UPDATE_SL":
             positions = await get_position_state(symbol)
             if positions:
@@ -361,7 +396,7 @@ async def receive_webhook(payload: WebhookPayload):
             print(f"[UPDATE_SL IGNORED] No active position for {symbol}", flush=True)
             return {"status": "ignored", "reason": "no_open_position"}
 
-        # 3. Market Exit / Emergency Close
+        # 3. Market Exit & Order Purge
         elif action == "CLOSE" or payload.order_type == "MARKET":
             stop_active_watcher(symbol)
             await cancel_all_tracked_orders(symbol)
@@ -371,7 +406,6 @@ async def receive_webhook(payload: WebhookPayload):
                 pos = positions[0]
                 pos_amt = abs(float(pos.get("positionAmount") or pos.get("quantity") or pos.get("positionAmt") or 0.0))
                 
-                # Check that position is truly open before submitting market close
                 if pos_amt > 0.0001:
                     pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
                     close_side = "SELL" if "BUY" in pos_side else "BUY"
@@ -383,10 +417,11 @@ async def receive_webhook(payload: WebhookPayload):
                         qty=pos_amt,
                         reduce_only=True
                     )
-                    print(f"[MARKET EXIT] Closed position of {pos_amt} {symbol}", flush=True)
+                    print(f"[MARKET EXIT SUCCESS] Closed position of {pos_amt} {symbol}: status={status}", flush=True)
+                    await cancel_all_exchange_open_orders(symbol)
                     return {"status": "closed", "data": data}
                 else:
-                    print("[MARKET EXIT IGNORED] Position is already 0 (likely closed by resting Stop Limit).", flush=True)
+                    print("[MARKET EXIT IGNORED] Position is already 0.", flush=True)
                     return {"status": "ignored", "reason": "already_flat"}
             else:
                 print("[MARKET EXIT IGNORED] Position is already flat.", flush=True)
@@ -395,8 +430,7 @@ async def receive_webhook(payload: WebhookPayload):
         # 4. Cancel Pending Entry
         elif action == "CANCEL_ENTRY":
             stop_active_watcher(symbol)
-            if symbol in active_limit_cids:
-                await cancel_order(active_limit_cids.pop(symbol))
+            await cancel_all_tracked_orders(symbol)
             return {"status": "cancelled"}
 
     return {"status": "unhandled_action"}
