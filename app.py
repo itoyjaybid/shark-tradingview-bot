@@ -200,7 +200,7 @@ async def cancel_order(client_order_id: str):
     return data
 
 async def cancel_all_exchange_open_orders(symbol: str):
-    """Directly queries Shark orderbook and cancels every resting limit/stop order."""
+    """Queries Shark orderbook directly and cancels every resting limit/stop order."""
     target = clean_symbol(symbol)
     status, res = await shark_call("GET", "/v1/order/open-orders", query_params={"symbol": target, "pageSize": "100"})
     if status == 200:
@@ -257,8 +257,12 @@ async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: 
             await asyncio.sleep(1.5)
             positions = await get_position_state(symbol)
             if positions:
-                sl_side = "SELL" if side == "BUY" else "BUY"
+                pos = positions[0]
+                pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
+                is_long = ("BUY" in pos_side) or ("LONG" in pos_side) or (side.upper() == "BUY")
+                sl_side = "SELL" if is_long else "BUY"
                 limit_price = (sl_price - sl_buffer) if sl_side == "SELL" else (sl_price + sl_buffer)
+                
                 status, data = await place_shark_order(
                     symbol=symbol,
                     side=sl_side,
@@ -271,7 +275,7 @@ async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: 
                 cid = data.get("clientOrderId") or data.get("data", {}).get("clientOrderId")
                 if cid:
                     active_sl_cids[symbol] = str(cid)
-                print(f"[SL ATTACHED] Fill detected! Placed Stop Limit @ {sl_price} (Limit {limit_price}): status={status}", flush=True)
+                print(f"[SL ATTACHED] Fill detected! Placed Stop Limit {sl_side} @ {sl_price} (Limit {limit_price}): status={status}", flush=True)
                 sl_placed = True
 
         # Phase 2: Active Trade Monitor — Auto-purge if closed manually on exchange
@@ -279,7 +283,6 @@ async def watch_limit_and_place_sl(symbol: str, client_order_id: str, sl_price: 
         while True:
             await asyncio.sleep(2.0)
             positions = await get_position_state(symbol)
-            # If position was closed manually on Shark Exchange, positions becomes empty
             if not positions:
                 print(f"[MANUAL EXIT DETECTED] Position is flat! Auto-cancelling all resting SL/buffers on {symbol}...", flush=True)
                 await cancel_all_exchange_open_orders(symbol)
@@ -372,7 +375,9 @@ async def receive_webhook(payload: WebhookPayload):
                 
                 if pos_amt > 0.0001:
                     pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
-                    sl_side = "SELL" if "BUY" in pos_side else "BUY"
+                    # Robust check: matches BUY, LONG, or payload.position_side
+                    is_long = ("BUY" in pos_side) or ("LONG" in pos_side) or (payload.position_side and "BUY" in payload.position_side.upper())
+                    sl_side = "SELL" if is_long else "BUY"
                     
                     if symbol in active_sl_cids:
                         await cancel_order(active_sl_cids.pop(symbol))
@@ -390,7 +395,7 @@ async def receive_webhook(payload: WebhookPayload):
                     cid = data.get("clientOrderId") or data.get("data", {}).get("clientOrderId")
                     if cid:
                         active_sl_cids[symbol] = str(cid)
-                    print(f"[PROFIT LOCK APPLIED] Modified Stop Limit to {sl_price}: status={status}", flush=True)
+                    print(f"[PROFIT LOCK APPLIED] Modified Stop Limit to {sl_price} ({sl_side}): status={status}", flush=True)
                     return {"status": "sl_updated", "data": data}
             
             print(f"[UPDATE_SL IGNORED] No active position for {symbol}", flush=True)
@@ -408,7 +413,9 @@ async def receive_webhook(payload: WebhookPayload):
                 
                 if pos_amt > 0.0001:
                     pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
-                    close_side = "SELL" if "BUY" in pos_side else "BUY"
+                    # Robust check: matches BUY, LONG, or payload.position_side
+                    is_long = ("BUY" in pos_side) or ("LONG" in pos_side) or (payload.position_side and "BUY" in payload.position_side.upper())
+                    close_side = "SELL" if is_long else "BUY"
                     
                     status, data = await place_shark_order(
                         symbol=symbol,
@@ -417,7 +424,7 @@ async def receive_webhook(payload: WebhookPayload):
                         qty=pos_amt,
                         reduce_only=True
                     )
-                    print(f"[MARKET EXIT SUCCESS] Closed position of {pos_amt} {symbol}: status={status}", flush=True)
+                    print(f"[MARKET EXIT SUCCESS] Closed position of {pos_amt} {symbol} with {close_side}: status={status}", flush=True)
                     await cancel_all_exchange_open_orders(symbol)
                     return {"status": "closed", "data": data}
                 else:
