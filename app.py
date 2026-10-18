@@ -26,7 +26,10 @@ active_watcher_tasks = {}
 active_limit_cids = {}
 active_sl_cids = {}
 
-# Thread lock and action deduplication to prevent duplicate orders
+# Execution tracking to prevent post-close race conditions
+last_close_time: float = 0.0
+
+# Thread lock and action deduplication
 action_lock = asyncio.Lock()
 recent_actions = {}
 
@@ -200,7 +203,7 @@ async def cancel_order(client_order_id: str):
     return data
 
 async def cancel_all_exchange_open_orders(symbol: str):
-    """Queries Shark orderbook directly and cancels every resting limit/stop order."""
+    """Directly queries Shark orderbook and cancels every resting limit/stop order."""
     target = clean_symbol(symbol)
     status, res = await shark_call("GET", "/v1/order/open-orders", query_params={"symbol": target, "pageSize": "100"})
     if status == 200:
@@ -315,6 +318,7 @@ async def manual_purge(symbol: str = "BTCUSDT"):
 
 @app.post("/webhook")
 async def receive_webhook(payload: WebhookPayload):
+    global last_close_time
     expected_secret = WEBHOOK_SECRET
     provided_secret = payload.get_secret()
     if expected_secret and expected_secret != "MY_SECRET_KEY" and provided_secret != expected_secret:
@@ -368,6 +372,11 @@ async def receive_webhook(payload: WebhookPayload):
 
         # 2. Dynamic Trailing SL / Profit Lock
         elif action == "UPDATE_SL":
+            # Guard against delayed UPDATE_SL after trade has closed
+            if (time.time() - last_close_time) < 5.0:
+                print(f"[UPDATE_SL IGNORED] Dropping SL update because trade was recently closed.", flush=True)
+                return {"status": "ignored", "reason": "recently_closed"}
+
             positions = await get_position_state(symbol)
             if positions:
                 pos = positions[0]
@@ -375,7 +384,6 @@ async def receive_webhook(payload: WebhookPayload):
                 
                 if pos_amt > 0.0001:
                     pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
-                    # Robust check: matches BUY, LONG, or payload.position_side
                     is_long = ("BUY" in pos_side) or ("LONG" in pos_side) or (payload.position_side and "BUY" in payload.position_side.upper())
                     sl_side = "SELL" if is_long else "BUY"
                     
@@ -403,6 +411,7 @@ async def receive_webhook(payload: WebhookPayload):
 
         # 3. Market Exit & Order Purge
         elif action == "CLOSE" or payload.order_type == "MARKET":
+            last_close_time = time.time()
             stop_active_watcher(symbol)
             await cancel_all_tracked_orders(symbol)
                 
@@ -413,7 +422,6 @@ async def receive_webhook(payload: WebhookPayload):
                 
                 if pos_amt > 0.0001:
                     pos_side = str(pos.get("positionType") or pos.get("side") or "").upper()
-                    # Robust check: matches BUY, LONG, or payload.position_side
                     is_long = ("BUY" in pos_side) or ("LONG" in pos_side) or (payload.position_side and "BUY" in payload.position_side.upper())
                     close_side = "SELL" if is_long else "BUY"
                     
