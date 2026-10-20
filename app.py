@@ -166,55 +166,68 @@ async def shark_call(method: str, endpoint: str, query_params: dict = None, body
     return await asyncio.to_thread(shark_send_request, method, endpoint, query_params, body_dict)
 
 # =============================================================================
-# EXCHANGE OPERATIONS & TOTAL PURGING
+# EXCHANGE OPERATIONS WITH RETRY RESILIENCE
 # =============================================================================
-async def get_position_state(symbol: str):
+async def get_position_state(symbol: str, max_retries: int = 3):
     target = clean_symbol(symbol)
     params = {
         "sortOrder": "desc",
         "pageSize": "100",
         "symbol": target
     }
-    status, res = await shark_call("GET", "/v1/positions/OPEN", query_params=params)
-    if status != 200:
-        return []
-    
-    items = res if isinstance(res, list) else res.get("data", [])
-    if isinstance(items, dict):
-        items = [items]
-        
-    active_positions = []
-    for pos in items:
-        if not isinstance(pos, dict):
+    for attempt in range(max_retries):
+        status, res = await shark_call("GET", "/v1/positions/OPEN", query_params=params)
+        if status == 200:
+            items = res if isinstance(res, list) else res.get("data", [])
+            if isinstance(items, dict):
+                items = [items]
+            active_positions = []
+            for pos in items:
+                if not isinstance(pos, dict):
+                    continue
+                sym = str(pos.get("contractPair") or pos.get("symbol") or "").upper()
+                if target in sym:
+                    raw_qty = float(pos.get("positionAmount") or pos.get("quantity") or pos.get("positionAmt") or 0.0)
+                    if abs(raw_qty) > 0.0001:
+                        active_positions.append(pos)
+            return active_positions
+        if status in [500, 502, 503, 504] and attempt < max_retries - 1:
+            print(f"[RETRY NOTICE] get_position_state hit {status}. Retrying in 0.5s (attempt {attempt + 2}/{max_retries})...", flush=True)
+            await asyncio.sleep(0.5)
             continue
-        sym = str(pos.get("contractPair") or pos.get("symbol") or "").upper()
-        if target in sym:
-            raw_qty = float(pos.get("positionAmount") or pos.get("quantity") or pos.get("positionAmt") or 0.0)
-            if abs(raw_qty) > 0.0001:
-                active_positions.append(pos)
-    return active_positions
+        break
+    return []
 
-async def cancel_order(client_order_id: str):
+async def cancel_order(client_order_id: str, max_retries: int = 2):
     if not client_order_id:
         return None
-    status, data = await shark_call("DELETE", "/v1/order/delete-order", body_dict={"clientOrderId": str(client_order_id)})
-    if status in [200, 204]:
-        print(f"[CANCEL ORDER] cid={client_order_id} status={status}", flush=True)
-    return data
+    for attempt in range(max_retries):
+        status, data = await shark_call("DELETE", "/v1/order/delete-order", body_dict={"clientOrderId": str(client_order_id)})
+        if status in [200, 204]:
+            print(f"[CANCEL ORDER] cid={client_order_id} status={status}", flush=True)
+            return data
+        if status in [500, 502, 503, 504] and attempt < max_retries - 1:
+            await asyncio.sleep(0.3)
+            continue
+        return data
 
-async def cancel_all_exchange_open_orders(symbol: str):
+async def cancel_all_exchange_open_orders(symbol: str, max_retries: int = 2):
     """Directly queries Shark orderbook and cancels every resting limit/stop order."""
     target = clean_symbol(symbol)
-    status, res = await shark_call("GET", "/v1/order/open-orders", query_params={"symbol": target, "pageSize": "100"})
-    if status == 200:
-        orders = res if isinstance(res, list) else res.get("data", [])
-        if isinstance(orders, dict):
-            orders = [orders]
-        for ord_item in orders:
-            cid = ord_item.get("clientOrderId") or ord_item.get("id")
-            if cid:
-                await cancel_order(str(cid))
-                print(f"[PURGED ORDER] Cancelled open order {cid} on {target}", flush=True)
+    for attempt in range(max_retries):
+        status, res = await shark_call("GET", "/v1/order/open-orders", query_params={"symbol": target, "pageSize": "100"})
+        if status == 200:
+            orders = res if isinstance(res, list) else res.get("data", [])
+            if isinstance(orders, dict):
+                orders = [orders]
+            for ord_item in orders:
+                cid = ord_item.get("clientOrderId") or ord_item.get("id")
+                if cid:
+                    await cancel_order(str(cid))
+                    print(f"[PURGED ORDER] Cancelled open order {cid} on {target}", flush=True)
+            return
+        if status in [500, 502, 503, 504] and attempt < max_retries - 1:
+            await asyncio.sleep(0.4)
 
 async def cancel_all_tracked_orders(symbol: str):
     if symbol in active_sl_cids:
@@ -223,7 +236,7 @@ async def cancel_all_tracked_orders(symbol: str):
         await cancel_order(active_limit_cids.pop(symbol))
     await cancel_all_exchange_open_orders(symbol)
 
-async def place_shark_order(symbol: str, side: str, order_type: str, qty: float, price: float = None, stop_price: float = None, reduce_only: bool = False):
+async def place_shark_order(symbol: str, side: str, order_type: str, qty: float, price: float = None, stop_price: float = None, reduce_only: bool = False, max_retries: int = 3):
     target = clean_symbol(symbol)
     payload = {
         "deviceType": "WEB",
@@ -241,7 +254,15 @@ async def place_shark_order(symbol: str, side: str, order_type: str, qty: float,
         payload["stopPrice"] = clean_num(stop_price, 2)
         payload["price"] = clean_num(price, 2)
 
-    return await shark_call("POST", "/v1/order/place-order", body_dict=payload)
+    for attempt in range(max_retries):
+        status, data = await shark_call("POST", "/v1/order/place-order", body_dict=payload)
+        if status in [200, 201]:
+            return status, data
+        if status in [500, 502, 503, 504] and attempt < max_retries - 1:
+            print(f"[RETRY NOTICE] Shark order returned HTTP {status}. Retrying in 0.5s (attempt {attempt + 2}/{max_retries})...", flush=True)
+            await asyncio.sleep(0.5)
+            continue
+        return status, data
 
 def stop_active_watcher(symbol: str):
     if symbol in active_watcher_tasks and not active_watcher_tasks[symbol].done():
