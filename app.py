@@ -8,7 +8,9 @@ import urllib.request
 import urllib.error
 from email.utils import parsedate_to_datetime
 from typing import Optional, Any
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Shark Exchange TradingView Webhook Bridge")
@@ -40,13 +42,26 @@ STANDARD_HEADERS = {
 }
 
 # =============================================================================
+# 422 VALIDATION ERROR HANDLER (Captures Raw Inbound Text)
+# =============================================================================
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    raw_body = await request.body()
+    decoded = raw_body.decode("utf-8", errors="ignore")
+    print(f"[422 PAYLOAD REJECTED] Validation Error: {exc.errors()} | Raw Body: {decoded}", flush=True)
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body": decoded},
+    )
+
+# =============================================================================
 # FLEXIBLE SCHEMAS
 # =============================================================================
 class WebhookPayload(BaseModel):
     secret: Optional[str] = None
     passphrase: Optional[str] = None
-    symbol: str = "BTCUSDT"
-    action: str                                  # BUY, SELL, CLOSE, CANCEL_ENTRY, UPDATE_SL
+    symbol: Optional[str] = "BTCUSDT"
+    action: Optional[str] = "NONE"               # BUY, SELL, CLOSE, CANCEL_ENTRY, UPDATE_SL
     order_type: Optional[str] = "LIMIT"          # LIMIT, MARKET, CANCEL, STOP_LIMIT
     quantity: Optional[float] = None
     qty: Optional[float] = None
@@ -345,14 +360,18 @@ async def receive_webhook(payload: WebhookPayload):
     if expected_secret and expected_secret != "MY_SECRET_KEY" and provided_secret != expected_secret:
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    action = payload.action.upper()
+    action = (payload.action or "NONE").upper()
     trade_id = str(payload.trade_id)
-    symbol = clean_symbol(payload.symbol)
+    symbol = clean_symbol(payload.symbol or "BTCUSDT")
     qty = payload.get_qty()
     sl_price = payload.get_sl()
     sl_buffer = payload.get_buffer()
     price = payload.price
     now = time.time()
+
+    if action == "NONE":
+        print(f"[WEBHOOK IGNORED] Empty or invalid action received: trade_id={trade_id}", flush=True)
+        return {"status": "ignored", "reason": "empty_action"}
 
     # Deduplication check: drop duplicate signals arriving within 4 seconds
     dedup_key = f"{symbol}_{action}_{trade_id}"
